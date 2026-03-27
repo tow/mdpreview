@@ -56,7 +56,7 @@ struct MarkdownWebView: NSViewRepresentable {
         }
         if searchText != context.coordinator.lastSearchText {
             context.coordinator.lastSearchText = searchText
-            context.coordinator.find(searchText, backwards: false)
+            context.coordinator.find(searchText, backwards: false, newQuery: true)
         }
     }
 
@@ -71,18 +71,19 @@ struct MarkdownWebView: NSViewRepresentable {
         var lastSearchBackwardTrigger: Int = 0
         var lastSearchText: String = ""
 
-        func find(_ text: String, backwards: Bool) {
+        func find(_ text: String, backwards: Bool, newQuery: Bool = false) {
             guard let webView else { return }
             guard !text.isEmpty else {
-                // Clear selection when search is empty
                 webView.evaluateJavaScript("window.getSelection().removeAllRanges()", completionHandler: nil)
                 return
             }
-            let config = WKFindConfiguration()
-            config.backwards = backwards
-            config.wraps = true
-            config.caseSensitive = false
-            webView.find(text, configuration: config) { _ in }
+            guard let jsonData = try? JSONEncoder().encode(text),
+                  let jsonString = String(data: jsonData, encoding: .utf8) else { return }
+            // When the query changes, clear selection first so find() starts from the top
+            let clear = newQuery ? "window.getSelection().removeAllRanges();" : ""
+            // window.find(text, caseSensitive, backwards, wrapAround)
+            let js = "\(clear)window.find(\(jsonString), false, \(backwards), true)"
+            webView.evaluateJavaScript(js, completionHandler: nil)
         }
         var lastThemeID: String = ""
 

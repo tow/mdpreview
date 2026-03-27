@@ -20,6 +20,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.arcticrex.MarkdownPreview
         INFOPLIST_FILE: MarkdownPreview/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO

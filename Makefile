@@ -11,7 +11,8 @@ build:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug build
 
 install: build
-	cp -Rf "$(BUILT)" /Applications/$(APP_NAME).app
+	rm -rf /Applications/$(APP_NAME).app
+	cp -R "$(BUILT)" /Applications/$(APP_NAME).app
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f /Applications/$(APP_NAME).app
 	@echo "Installed to /Applications/$(APP_NAME).app"

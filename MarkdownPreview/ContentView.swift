@@ -25,6 +25,11 @@ final class AppState: ObservableObject {
         watcher.onChange = { [weak self] in
             self?.reloadCurrentFile()
         }
+        NotificationCenter.default.addObserver(
+            forName: .openMarkdownFile, object: nil, queue: .main
+        ) { [weak self] note in
+            self?.selectedFile = note.object as? URL
+        }
     }
 
     private func onSelectionChanged() {

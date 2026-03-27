@@ -15,26 +15,34 @@ final class AppState: ObservableObject {
     func viewPDF() { viewPDFTrigger += 1 }
 
     private let watcher = FileWatcher()
-    private let rootURL = URL(fileURLWithPath:
+    private let defaultRootURL = URL(fileURLWithPath:
         ProcessInfo.processInfo.environment["MDPREVIEW_ROOT"]
             ?? FileManager.default.homeDirectoryForCurrentUser.path
     )
 
     init() {
-        rootNodes = FileNode.loadChildren(of: rootURL)
+        rootNodes = FileNode.loadChildren(of: defaultRootURL)
         watcher.onChange = { [weak self] in
             self?.reloadCurrentFile()
         }
         NotificationCenter.default.addObserver(
             forName: .openMarkdownFile, object: nil, queue: .main
         ) { [weak self] note in
-            self?.selectedFile = note.object as? URL
+            if let url = note.object as? URL {
+                self?.openFile(url)
+            }
         }
         // Pick up a file passed at launch. Deferred so didSet fires after init completes.
         if let delegate = NSApp.delegate as? AppDelegate, let url = delegate.pendingURL {
             delegate.pendingURL = nil
-            DispatchQueue.main.async { self.selectedFile = url }
+            DispatchQueue.main.async { self.openFile(url) }
         }
+    }
+
+    func openFile(_ url: URL) {
+        let dir = url.deletingLastPathComponent()
+        rootNodes = FileNode.loadChildren(of: dir)
+        selectedFile = url
     }
 
     private func onSelectionChanged() {

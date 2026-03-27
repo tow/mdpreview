@@ -3,6 +3,7 @@ import SwiftUI
 @MainActor
 final class AppState: ObservableObject {
     @Published var rootNodes: [FileNode] = []
+    @Published var rootDirectoryName: String = ""
     @Published var selectedFile: URL? {
         didSet { onSelectionChanged() }
     }
@@ -14,11 +15,31 @@ final class AppState: ObservableObject {
     @Published var searchText: String = ""
     @Published var searchForwardTrigger: Int = 0
     @Published var searchBackwardTrigger: Int = 0
+    @Published var viewMode: ViewMode = .reading
+    @Published var viewModeTrigger: Int = 0
+    @Published var pdfConfig: PDFConfig = PDFConfig.load()
 
     func exportPDF() { exportPDFTrigger += 1 }
     func viewPDF() { viewPDFTrigger += 1 }
     func findNext() { searchForwardTrigger += 1 }
     func findPrevious() { searchBackwardTrigger += 1 }
+
+    func toggleViewMode() {
+        viewMode = viewMode == .reading ? .document : .reading
+        if viewMode == .document {
+            // Re-read config so edits take effect immediately
+            pdfConfig = PDFConfig.load()
+        }
+        viewModeTrigger += 1
+    }
+
+    var resolvedPDFConfigJSON: String {
+        let title = selectedFile?.deletingPathExtension().lastPathComponent ?? "Untitled"
+        let formatter = DateFormatter()
+        formatter.dateStyle = .long
+        let date = formatter.string(from: Date())
+        return pdfConfig.resolvedJSON(title: title, date: date)
+    }
 
     private let watcher = FileWatcher()
     private let defaultRootURL = URL(fileURLWithPath:
@@ -27,6 +48,7 @@ final class AppState: ObservableObject {
     )
 
     init() {
+        rootDirectoryName = defaultRootURL.lastPathComponent
         rootNodes = FileNode.loadChildren(of: defaultRootURL)
         watcher.onChange = { [weak self] in
             self?.reloadCurrentFile()
@@ -50,6 +72,7 @@ final class AppState: ObservableObject {
 
     func openFile(_ url: URL) {
         let dir = url.deletingLastPathComponent()
+        rootDirectoryName = dir.lastPathComponent
         rootNodes = FileNode.loadChildren(of: dir)
         selectedFile = url
     }
@@ -78,7 +101,7 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            FileTreeView(nodes: state.rootNodes, selectedFile: $state.selectedFile)
+            FileTreeView(nodes: state.rootNodes, selectedFile: $state.selectedFile, directoryName: state.rootDirectoryName)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 400)
         } detail: {
             if state.selectedFile != nil {
@@ -91,7 +114,11 @@ struct ContentView: View {
                         theme: state.currentTheme,
                         searchText: state.searchText,
                         searchForwardTrigger: state.searchForwardTrigger,
-                        searchBackwardTrigger: state.searchBackwardTrigger
+                        searchBackwardTrigger: state.searchBackwardTrigger,
+                        viewMode: state.viewMode,
+                        pdfConfigJSON: state.resolvedPDFConfigJSON,
+                        viewModeTrigger: state.viewModeTrigger,
+                        baseURL: state.selectedFile?.deletingLastPathComponent()
                     )
                     if state.showSearch {
                         SearchBar(
@@ -109,6 +136,24 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.15), value: state.showSearch)
                 .toolbar {
                     ToolbarItem {
+                        Picker("Mode", selection: Binding(
+                            get: { state.viewMode },
+                            set: { newMode in
+                                state.viewMode = newMode
+                                if newMode == .document {
+                                    state.pdfConfig = PDFConfig.load()
+                                }
+                                state.viewModeTrigger += 1
+                            }
+                        )) {
+                            ForEach(ViewMode.allCases) { mode in
+                                Label(mode.label, systemImage: mode.icon).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .help("Switch between Reading and Document mode")
+                    }
+                    ToolbarItem {
                         Button {
                             withAnimation { state.showSearch.toggle() }
                             if !state.showSearch { state.searchText = "" }
@@ -125,18 +170,20 @@ struct ContentView: View {
                         .pickerStyle(.menu)
                         .help("Switch theme")
                     }
-                    ToolbarItem {
-                        Button {
-                            state.viewPDF()
-                        } label: {
-                            Label("View PDF", systemImage: "doc.text.magnifyingglass")
+                    if state.viewMode == .document {
+                        ToolbarItem {
+                            Button {
+                                state.viewPDF()
+                            } label: {
+                                Label("View PDF", systemImage: "doc.text.magnifyingglass")
+                            }
                         }
-                    }
-                    ToolbarItem {
-                        Button {
-                            state.exportPDF()
-                        } label: {
-                            Label("Save PDF", systemImage: "arrow.down.doc")
+                        ToolbarItem {
+                            Button {
+                                state.exportPDF()
+                            } label: {
+                                Label("Save PDF", systemImage: "arrow.down.doc")
+                            }
                         }
                     }
                 }

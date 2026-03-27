@@ -7,7 +7,6 @@ BUILT    = $(shell find $(DERIVED) -name "$(APP_NAME).app" -path "*/Debug/*" 2>/
 .PHONY: build install open clean
 
 build:
-	xcodegen generate
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug build
 
 install: build

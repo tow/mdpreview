@@ -12,6 +12,11 @@
             max-width: 900px;
             margin: 0 auto;
         }
+        /* In document mode, let Paged.js control width */
+        .pagedjs_page_content #content {
+            max-width: none;
+            margin: 0;
+        }
 
         /* Table overrides — applied on top of every theme */
         #content table {
@@ -55,31 +60,293 @@
                 background-color: #1c2128;
             }
         }
+
+        /* Document mode: page edge styling */
+        .pagedjs_page {
+            box-shadow: 0 1px 6px rgba(0,0,0,0.12), 0 0 0 1px rgba(0,0,0,0.06);
+            margin-bottom: 20px;
+            background: white;
+        }
+        .pagedjs_pages {
+            padding: 20px 0;
+        }
+        /* Style margin box text */
+        .pagedjs_margin-content {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-size: 9pt;
+            color: #666;
+        }
+        /* Header bottom border */
+        .pagedjs_margin-top-left,
+        .pagedjs_margin-top-center,
+        .pagedjs_margin-top-right {
+            border-bottom: 0.5px solid #ddd;
+            padding-bottom: 4px;
+        }
+        /* Footer top border */
+        .pagedjs_margin-bottom-left,
+        .pagedjs_margin-bottom-center,
+        .pagedjs_margin-bottom-right {
+            border-top: 0.5px solid #ddd;
+            padding-top: 4px;
+        }
+        /* Logo in header */
+        .pagedjs_margin-content img {
+            max-height: 20px;
+            vertical-align: middle;
+        }
+
+        /* Running logo element — hidden from flow, picked up by Paged.js */
+        #running-logo {
+            position: running(logo);
+        }
+        #running-logo img {
+            max-height: 20px;
+        }
+
+        /* Hide body during pagination transitions — applied via class to avoid flash */
+        body.paginating {
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
     </style>
     <script src="marked.min.js"></script>
     <script src="highlight.min.js"></script>
+    <script>window.PagedConfig = { auto: false };</script>
+    <script src="paged.polyfill.js"></script>
     <script>
         marked.use({ gfm: true, breaks: false });
 
+        var _rawMarkdown = '';
+        var _currentMode = 'reading';
+        var _currentConfig = null;
+        var _paginationGen = 0;
+        var _debounceTimer = null;
+        var _baseURL = '';
+
+        function setBaseURL(url) {
+            _baseURL = url;
+        }
+
+        // Resolve relative image/link paths against the markdown file's directory
+        function resolveRelativePaths(container) {
+            if (!_baseURL) return;
+            container.querySelectorAll('img').forEach(function(img) {
+                var src = img.getAttribute('src');
+                if (src && !src.match(/^(https?:|data:|file:\/)/)) {
+                    img.src = _baseURL + src;
+                }
+            });
+            container.querySelectorAll('a').forEach(function(a) {
+                var href = a.getAttribute('href');
+                if (href && !href.match(/^(https?:|data:|file:\/|#|mailto:)/)) {
+                    a.href = _baseURL + href;
+                }
+            });
+        }
+
         function renderMarkdown(md) {
+            _rawMarkdown = md;
+            if (_currentMode === 'reading') {
+                renderReading();
+            } else {
+                debouncePaginate();
+            }
+        }
+
+        function renderReading() {
+            var el = document.getElementById('content');
+            if (!el) {
+                // Rebuild content div if Paged.js destroyed it
+                el = document.createElement('div');
+                el.id = 'content';
+                document.body.appendChild(el);
+            }
             var scrollTop = window.scrollY;
-            document.getElementById('content').innerHTML = marked.parse(md);
-            document.querySelectorAll('pre code').forEach(function(block) {
+            el.innerHTML = marked.parse(_rawMarkdown);
+            el.className = isGithubTheme() ? 'markdown-body' : '';
+            resolveRelativePaths(el);
+            document.querySelectorAll('#content pre code').forEach(function(block) {
                 hljs.highlightElement(block);
             });
             window.scrollTo(0, scrollTop);
         }
 
+        function debouncePaginate() {
+            clearTimeout(_debounceTimer);
+            _debounceTimer = setTimeout(function() {
+                paginate();
+            }, 300);
+        }
+
+        async function paginate() {
+            var gen = ++_paginationGen;
+            // Hide during transition (class may already be set by setViewMode)
+            document.body.classList.add('paginating');
+            // Clean up previous Paged.js output
+            removePagedDOM();
+            // Ensure content div exists
+            var el = document.getElementById('content');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'content';
+                document.body.appendChild(el);
+            }
+            // Render markdown into content (hidden)
+            el.innerHTML = marked.parse(_rawMarkdown);
+            el.className = isGithubTheme() ? 'markdown-body' : '';
+            resolveRelativePaths(el);
+            document.querySelectorAll('#content pre code').forEach(function(block) {
+                hljs.highlightElement(block);
+            });
+            // Inject @page CSS from config
+            injectPagedCSS(_currentConfig);
+            // Wrap content so theme CSS selectors still match inside Paged.js pages
+            var wrapperClass = isGithubTheme() ? 'markdown-body' : '';
+            var logoHTML = '';
+            if (_currentConfig && _currentConfig.logoBase64) {
+                logoHTML = '<div id="running-logo"><img src="' + _currentConfig.logoBase64 + '"></div>';
+            }
+            var wrappedHTML = logoHTML + '<div id="content" class="' + wrapperClass + '">' + el.innerHTML + '</div>';
+            // Run Paged.js
+            try {
+                var paged = new Paged.Previewer();
+                var flow = await paged.preview(
+                    wrappedHTML,
+                    [],
+                    document.body
+                );
+                if (gen !== _paginationGen) return; // stale
+                // Remove the original content div (Paged.js creates its own)
+                if (el.parentNode) el.parentNode.removeChild(el);
+            } catch(e) {
+                console.error('Paged.js error:', e);
+            }
+            // Reveal once pagination is complete
+            document.body.classList.remove('paginating');
+            // Notify Swift to fade in the native webview
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.paginationDone) {
+                window.webkit.messageHandlers.paginationDone.postMessage('done');
+            }
+        }
+
+        function injectPagedCSS(config) {
+            // Remove old paged styles
+            var old = document.getElementById('paged-styles');
+            if (old) old.remove();
+
+            if (!config) return;
+
+            var m = config.margins || { top: 25, right: 20, bottom: 25, left: 20 };
+            var size = config.pageSize || 'A4';
+
+            var css = '@page {\n';
+            css += '  size: ' + size + ';\n';
+            css += '  margin: ' + m.top + 'mm ' + m.right + 'mm ' + m.bottom + 'mm ' + m.left + 'mm;\n';
+
+            // Header margin boxes
+            if (config.header) {
+                if (config.header.left)   css += '  @top-left { content: '   + buildContentValue(config.header.left) + '; }\n';
+                if (config.header.center) css += '  @top-center { content: ' + buildContentValue(config.header.center) + '; }\n';
+                if (config.header.right && !config.logoBase64) {
+                    css += '  @top-right { content: ' + buildContentValue(config.header.right) + '; }\n';
+                }
+            }
+            // Logo in top-right via running element
+            if (config.logoBase64) {
+                css += '  @top-right { content: element(logo); }\n';
+            }
+
+            // Footer margin boxes
+            if (config.footer) {
+                if (config.footer.left)   css += '  @bottom-left { content: '   + buildContentValue(config.footer.left) + '; }\n';
+                if (config.footer.center) css += '  @bottom-center { content: ' + buildContentValue(config.footer.center) + '; }\n';
+                if (config.footer.right)  css += '  @bottom-right { content: '  + buildContentValue(config.footer.right) + '; }\n';
+            }
+
+            css += '}\n';
+
+            // Page break rules
+            css += 'h1, h2, h3 { break-after: avoid; }\n';
+            css += 'pre, blockquote, figure, table { break-inside: avoid; }\n';
+            css += 'img { break-inside: avoid; }\n';
+            css += 'p { widows: 3; orphans: 3; }\n';
+
+            var style = document.createElement('style');
+            style.id = 'paged-styles';
+            style.textContent = css;
+            document.head.appendChild(style);
+
+            // Logo is injected into the content HTML passed to Paged.js
+            // (see paginate function) so it can be picked up as a running element
+        }
+
+        function buildContentValue(str) {
+            // Split on {{page}} and {{pages}} and build CSS content value
+            // e.g. "Page {{page}} of {{pages}}" → "Page " counter(page) " of " counter(pages)
+            var parts = str.split(/(\{\{page\}\}|\{\{pages\}\})/);
+            var result = '';
+            for (var i = 0; i < parts.length; i++) {
+                var p = parts[i];
+                if (p === '{{page}}') {
+                    result += ' counter(page) ';
+                } else if (p === '{{pages}}') {
+                    result += ' counter(pages) ';
+                } else if (p.length > 0) {
+                    result += '"' + p.replace(/"/g, '\\"') + '"';
+                }
+            }
+            return result.trim() || '""';
+        }
+
+        function removePagedDOM() {
+            // Remove Paged.js generated containers
+            var pages = document.querySelector('.pagedjs_pages');
+            if (pages) pages.remove();
+            // Remove paged styles
+            var style = document.getElementById('paged-styles');
+            if (style) style.remove();
+            // Remove running logo
+            var logo = document.getElementById('running-logo');
+            if (logo) logo.remove();
+        }
+
+        function setViewMode(mode, config) {
+            // Hide immediately before any DOM changes
+            document.body.classList.add('paginating');
+            _currentMode = mode;
+            _currentConfig = config;
+            if (mode === 'reading') {
+                removePagedDOM();
+                document.body.style.padding = '24px 32px';
+                document.body.style.background = '';
+                renderReading();
+                document.body.classList.remove('paginating');
+            } else {
+                document.body.style.padding = '0';
+                document.body.style.background = '#f0f0f0';
+                paginate();
+                // paginate() will remove the class when done
+            }
+        }
+
         function setTheme(cssFile, codeTheme) {
             document.getElementById('theme-link').href = cssFile;
             document.getElementById('code-theme-link').href = codeTheme;
-            // github theme needs the markdown-body class; others don't
+            // Update class on content div if it exists
             var el = document.getElementById('content');
-            if (cssFile.indexOf('github') !== -1) {
-                el.className = 'markdown-body';
-            } else {
-                el.className = '';
+            if (el) {
+                el.className = (cssFile.indexOf('github') !== -1) ? 'markdown-body' : '';
             }
+            // Re-paginate if in document mode
+            if (_currentMode === 'document' && _rawMarkdown) {
+                debouncePaginate();
+            }
+        }
+
+        function isGithubTheme() {
+            var link = document.getElementById('theme-link');
+            return link && link.href.indexOf('github') !== -1;
         }
     </script>
 </head>

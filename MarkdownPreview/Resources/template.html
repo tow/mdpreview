@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link id="theme-link" rel="stylesheet" href="github-markdown.min.css">
+    <link id="code-theme-link" rel="stylesheet" href="highlight-github.min.css">
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 24px 32px; }
+        #content {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        /* Table overrides — applied on top of every theme */
+        #content table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 1.25em 0;
+            font-size: 0.95em;
+        }
+        #content th,
+        #content td {
+            border: 1px solid #d0d7de;
+            padding: 8px 14px;
+            text-align: left;
+            vertical-align: top;
+            line-height: 1.5;
+        }
+        #content th {
+            font-weight: 600;
+            background-color: #f6f8fa;
+            white-space: nowrap;
+        }
+        #content tr:nth-child(even) td {
+            background-color: #fafbfc;
+        }
+        #content tr:hover td {
+            background-color: #f0f3f6;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            #content th,
+            #content td {
+                border-color: #30363d;
+            }
+            #content th {
+                background-color: #21262d;
+            }
+            #content tr:nth-child(even) td {
+                background-color: #161b22;
+            }
+            #content tr:hover td {
+                background-color: #1c2128;
+            }
+        }
+    </style>
+    <script src="marked.min.js"></script>
+    <script src="highlight.min.js"></script>
+    <script>
+        marked.use({ gfm: true, breaks: false });
+
+        function renderMarkdown(md) {
+            var scrollTop = window.scrollY;
+            document.getElementById('content').innerHTML = marked.parse(md);
+            document.querySelectorAll('pre code').forEach(function(block) {
+                hljs.highlightElement(block);
+            });
+            window.scrollTo(0, scrollTop);
+        }
+
+        function setTheme(cssFile, codeTheme) {
+            document.getElementById('theme-link').href = cssFile;
+            document.getElementById('code-theme-link').href = codeTheme;
+            // github theme needs the markdown-body class; others don't
+            var el = document.getElementById('content');
+            if (cssFile.indexOf('github') !== -1) {
+                el.className = 'markdown-body';
+            } else {
+                el.className = '';
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="content" class="markdown-body"></div>
+</body>
+</html>

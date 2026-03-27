@@ -30,10 +30,10 @@ final class AppState: ObservableObject {
         ) { [weak self] note in
             self?.selectedFile = note.object as? URL
         }
-        // Pick up a file that was passed at launch before this observer existed
+        // Pick up a file passed at launch. Deferred so didSet fires after init completes.
         if let delegate = NSApp.delegate as? AppDelegate, let url = delegate.pendingURL {
             delegate.pendingURL = nil
-            selectedFile = url
+            DispatchQueue.main.async { self.selectedFile = url }
         }
     }
 

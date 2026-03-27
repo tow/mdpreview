@@ -15,22 +15,26 @@ struct SearchBar: View {
             TextField("Find", text: $text)
                 .textFieldStyle(.plain)
                 .focused($focused)
-                .onSubmit { onNext() }
                 .frame(minWidth: 160)
+                .onKeyPress(keys: [.return, .upArrow, .downArrow]) { press in
+                    let backward = press.key == .upArrow ||
+                        (press.key == .return && press.modifiers.contains(.shift))
+                    if backward { onPrevious() } else { onNext() }
+                    return .handled
+                }
 
             if !text.isEmpty {
                 Button(action: onPrevious) {
                     Image(systemName: "chevron.up")
                 }
                 .buttonStyle(.plain)
-                .help("Previous match (⇧↩)")
-                .keyboardShortcut(.return, modifiers: .shift)
+                .help("Previous match (⇧↩ or ↑)")
 
                 Button(action: onNext) {
                     Image(systemName: "chevron.down")
                 }
                 .buttonStyle(.plain)
-                .help("Next match (↩)")
+                .help("Next match (↩ or ↓)")
             }
 
             Button(action: onClose) {

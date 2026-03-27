@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0450DAEB178E050DC8D8D0FC /* highlight.min.js in Resources */ = {isa = PBXBuildFile; fileRef = 1F29E72DA2E4BCF068568787 /* highlight.min.js */; };
 		07D7E3CF1E5F7397D9059530 /* theme-sakura.css in Resources */ = {isa = PBXBuildFile; fileRef = 8B90C8ABE7E91B78E0CB07EB /* theme-sakura.css */; };
+		36D03B528099CEEDAB00E553 /* SearchBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C7B63F08A2B93A483AF6621 /* SearchBar.swift */; };
 		3DA4003FE9D5FA2FD8C5FAE2 /* FileWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D61AF255730D4DEB2280665 /* FileWatcher.swift */; };
 		5215A1F7296E746F7FED1207 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7E82AF627B6779DAA10787A /* AppDelegate.swift */; };
 		64B1D1D8629E2B0771AD6F43 /* theme-simple.css in Resources */ = {isa = PBXBuildFile; fileRef = 43455317E02F04E7FF68D463 /* theme-simple.css */; };
@@ -40,6 +41,7 @@
 		5226A21A3C45F8787AA57AB3 /* highlight-github.min.css */ = {isa = PBXFileReference; lastKnownFileType = text.css; path = "highlight-github.min.css"; sourceTree = "<group>"; };
 		5491021A44DA939415B22CAF /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		6C3B77737F03E5126E3A3612 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		7C7B63F08A2B93A483AF6621 /* SearchBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchBar.swift; sourceTree = "<group>"; };
 		7EE7811897FE305506D51DEB /* MarkdownWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownWebView.swift; sourceTree = "<group>"; };
 		891CC7C57A89105476DB9567 /* marked.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = marked.min.js; sourceTree = "<group>"; };
 		8B90C8ABE7E91B78E0CB07EB /* theme-sakura.css */ = {isa = PBXFileReference; lastKnownFileType = text.css; path = "theme-sakura.css"; sourceTree = "<group>"; };
@@ -67,6 +69,7 @@
 				1D61AF255730D4DEB2280665 /* FileWatcher.swift */,
 				C04FE5DDB7D28E26AC478A2F /* Info.plist */,
 				7EE7811897FE305506D51DEB /* MarkdownWebView.swift */,
+				7C7B63F08A2B93A483AF6621 /* SearchBar.swift */,
 				6C3B77737F03E5126E3A3612 /* Theme.swift */,
 			);
 			path = MarkdownPreview;
@@ -193,6 +196,7 @@
 				91B91D09F971B3334372BDA6 /* FileTreeView.swift in Sources */,
 				3DA4003FE9D5FA2FD8C5FAE2 /* FileWatcher.swift in Sources */,
 				F18F4CFE778484249658A012 /* MarkdownWebView.swift in Sources */,
+				36D03B528099CEEDAB00E553 /* SearchBar.swift in Sources */,
 				8249938CCF73CA11A5E64556 /* Theme.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

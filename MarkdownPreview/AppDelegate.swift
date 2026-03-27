@@ -14,4 +14,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension Notification.Name {
     static let openMarkdownFile = Notification.Name("openMarkdownFile")
+    static let showSearch = Notification.Name("showSearch")
 }

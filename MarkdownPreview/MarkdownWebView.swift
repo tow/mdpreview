@@ -8,6 +8,9 @@ struct MarkdownWebView: NSViewRepresentable {
     let viewPDFTrigger: Int
     var exportFilename: String = "document"
     var theme: Theme = Theme.all[0]
+    var searchText: String = ""
+    var searchForwardTrigger: Int = 0
+    var searchBackwardTrigger: Int = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -43,6 +46,18 @@ struct MarkdownWebView: NSViewRepresentable {
             context.coordinator.lastViewPDFTrigger = viewPDFTrigger
             context.coordinator.viewPDF(filename: exportFilename)
         }
+        if searchForwardTrigger != context.coordinator.lastSearchForwardTrigger {
+            context.coordinator.lastSearchForwardTrigger = searchForwardTrigger
+            context.coordinator.find(searchText, backwards: false)
+        }
+        if searchBackwardTrigger != context.coordinator.lastSearchBackwardTrigger {
+            context.coordinator.lastSearchBackwardTrigger = searchBackwardTrigger
+            context.coordinator.find(searchText, backwards: true)
+        }
+        if searchText != context.coordinator.lastSearchText {
+            context.coordinator.lastSearchText = searchText
+            context.coordinator.find(searchText, backwards: false)
+        }
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
@@ -52,6 +67,23 @@ struct MarkdownWebView: NSViewRepresentable {
         private var pendingTheme: Theme?
         var lastExportTrigger: Int = 0
         var lastViewPDFTrigger: Int = 0
+        var lastSearchForwardTrigger: Int = 0
+        var lastSearchBackwardTrigger: Int = 0
+        var lastSearchText: String = ""
+
+        func find(_ text: String, backwards: Bool) {
+            guard let webView else { return }
+            guard !text.isEmpty else {
+                // Clear selection when search is empty
+                webView.evaluateJavaScript("window.getSelection().removeAllRanges()", completionHandler: nil)
+                return
+            }
+            let config = WKFindConfiguration()
+            config.backwards = backwards
+            config.wraps = true
+            config.caseSensitive = false
+            webView.find(text, configuration: config) { _ in }
+        }
         var lastThemeID: String = ""
 
         func applyTheme(_ theme: Theme) {

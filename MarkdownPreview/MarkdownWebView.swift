@@ -64,6 +64,7 @@ struct MarkdownWebView: NSViewRepresentable {
         weak var webView: WKWebView?
         private var isLoaded = false
         private var pendingContent: String?
+        private var lastRenderedContent: String = ""
         private var pendingTheme: Theme?
         var lastExportTrigger: Int = 0
         var lastViewPDFTrigger: Int = 0
@@ -127,6 +128,8 @@ struct MarkdownWebView: NSViewRepresentable {
         }
 
         func render(_ content: String) {
+            guard content != lastRenderedContent else { return }
+            lastRenderedContent = content
             if isLoaded {
                 evaluateRender(content)
             } else {

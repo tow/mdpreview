@@ -30,6 +30,11 @@ final class AppState: ObservableObject {
         ) { [weak self] note in
             self?.selectedFile = note.object as? URL
         }
+        // Pick up a file that was passed at launch before this observer existed
+        if let delegate = NSApp.delegate as? AppDelegate, let url = delegate.pendingURL {
+            delegate.pendingURL = nil
+            selectedFile = url
+        }
     }
 
     private func onSelectionChanged() {

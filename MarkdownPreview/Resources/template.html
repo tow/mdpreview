@@ -317,12 +317,16 @@
             _currentMode = mode;
             _currentConfig = config;
             if (mode === 'reading') {
+                // Allow dark mode in reading view
+                document.documentElement.style.colorScheme = '';
                 removePagedDOM();
                 document.body.style.padding = '24px 32px';
                 document.body.style.background = '';
                 renderReading();
                 document.body.classList.remove('paginating');
             } else {
+                // Force light mode for document/PDF view
+                document.documentElement.style.colorScheme = 'light';
                 document.body.style.padding = '0';
                 document.body.style.background = '#f0f0f0';
                 paginate();

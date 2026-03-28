@@ -8,6 +8,7 @@
     <style data-pagedjs-ignore>
         * { box-sizing: border-box; }
         body { margin: 0; padding: 24px 32px; }
+        #content img { display: block !important; margin-left: auto !important; margin-right: auto !important; width: auto !important; max-width: 100% !important; }
         #content {
             max-width: 900px;
             margin: 0 auto;
@@ -109,6 +110,15 @@
     <script>
         marked.use({ gfm: true, breaks: false });
 
+        // Pre-process markdown to convert ![alt](url =WIDTHx) to inline HTML
+        function preprocessImages(md) {
+            return md.replace(/!\[([^\]]*)\]\((\S+)\s+=(\d+%?)x(\d+%?)?\)/g, function(match, alt, src, w, h) {
+                var attrs = 'src="' + src + '" alt="' + alt.replace(/"/g, '&quot;') + '" width="' + w + '"';
+                if (h) attrs += ' height="' + h + '"';
+                return '<div><img ' + attrs + '></div>\n';
+            });
+        }
+
         var _rawMarkdown = '';
         var _currentMode = 'reading';
         var _currentConfig = null;
@@ -155,7 +165,7 @@
                 document.body.appendChild(el);
             }
             var scrollTop = window.scrollY;
-            el.innerHTML = marked.parse(_rawMarkdown);
+            el.innerHTML = marked.parse(preprocessImages(_rawMarkdown));
             el.className = isGithubTheme() ? 'markdown-body' : '';
             resolveRelativePaths(el);
             document.querySelectorAll('#content pre code').forEach(function(block) {
@@ -185,7 +195,7 @@
                 document.body.appendChild(el);
             }
             // Render markdown into content (hidden)
-            el.innerHTML = marked.parse(_rawMarkdown);
+            el.innerHTML = marked.parse(preprocessImages(_rawMarkdown));
             el.className = isGithubTheme() ? 'markdown-body' : '';
             resolveRelativePaths(el);
             document.querySelectorAll('#content pre code').forEach(function(block) {
@@ -276,7 +286,7 @@
             // Page break rules
             css += 'h1, h2, h3 { break-after: avoid; }\n';
             css += 'pre, blockquote, figure, table { break-inside: avoid; }\n';
-            css += 'img { break-inside: avoid; }\n';
+            css += 'img { break-inside: avoid; display: block; margin-left: auto; margin-right: auto; }\n';
             css += 'p { widows: 3; orphans: 3; }\n';
 
             return css;

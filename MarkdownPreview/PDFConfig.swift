@@ -19,6 +19,7 @@ struct PDFConfig: Codable {
     var header: PDFHeaderFooter = PDFHeaderFooter(left: "{{title}}", center: "", right: "{{date}}")
     var footer: PDFHeaderFooter = PDFHeaderFooter(left: "", center: "Page {{page}} of {{pages}}", right: "")
     var logoPath: String = ""
+    var companyLine: String = ""
 
     // MARK: - File location
 
@@ -80,6 +81,10 @@ struct PDFConfig: Codable {
 
         if let base64 = logoBase64() {
             dict["logoBase64"] = base64
+        }
+
+        if !companyLine.isEmpty {
+            dict["companyLine"] = resolve(companyLine, title: title, date: date)
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: dict),

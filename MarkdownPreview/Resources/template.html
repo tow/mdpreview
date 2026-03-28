@@ -90,18 +90,10 @@
             border-top: 0.5px solid #ddd;
             padding-top: 4px;
         }
-        /* Logo in header */
+        /* Logo in header margin box */
         .pagedjs_margin-content img {
             max-height: 20px;
             vertical-align: middle;
-        }
-
-        /* Running logo element — hidden from flow, picked up by Paged.js */
-        #running-logo {
-            position: running(logo);
-        }
-        #running-logo img {
-            max-height: 20px;
         }
 
         /* Hide body during pagination transitions — applied via class to avoid flash */
@@ -247,21 +239,33 @@
             css += '  size: ' + size + ';\n';
             css += '  margin: ' + m.top + 'mm ' + m.right + 'mm ' + m.bottom + 'mm ' + m.left + 'mm;\n';
 
-            // Header margin boxes
-            if (config.header) {
-                if (config.header.left)   css += '  @top-left { content: '   + buildContentValue(config.header.left) + '; }\n';
-                if (config.header.center) css += '  @top-center { content: ' + buildContentValue(config.header.center) + '; }\n';
-                if (config.header.right && !config.logoBase64) {
-                    css += '  @top-right { content: ' + buildContentValue(config.header.right) + '; }\n';
-                }
-            }
-            // Logo in top-right via running element
+            // Logo in top-left via running element
             if (config.logoBase64) {
-                css += '  @top-right { content: element(logo); }\n';
+                css += '  @top-left { content: element(logo); }\n';
+                css += '}\n';
+                css += '#running-logo { position: running(logo); }\n';
+                css += '#running-logo img { max-height: 20px; }\n';
+                css += '@page {\n';
+            } else if (config.header && config.header.left) {
+                css += '  @top-left { content: ' + buildContentValue(config.header.left) + '; }\n';
+            }
+
+            // Header remaining positions
+            if (config.header) {
+                if (config.header.center) css += '  @top-center { content: ' + buildContentValue(config.header.center) + '; }\n';
+                if (config.header.right)  css += '  @top-right { content: '  + buildContentValue(config.header.right) + '; }\n';
             }
 
             // Footer margin boxes
-            if (config.footer) {
+            if (config.companyLine) {
+                // Company notepaper: company details centered, page numbers right
+                css += '  @bottom-center { content: ' + buildContentValue(config.companyLine) + '; font-size: 7pt; color: #999; }\n';
+                if (config.footer) {
+                    if (config.footer.left)  css += '  @bottom-left { content: '  + buildContentValue(config.footer.left) + '; }\n';
+                    var pageContent = config.footer.center || config.footer.right;
+                    if (pageContent) css += '  @bottom-right { content: ' + buildContentValue(pageContent) + '; }\n';
+                }
+            } else if (config.footer) {
                 if (config.footer.left)   css += '  @bottom-left { content: '   + buildContentValue(config.footer.left) + '; }\n';
                 if (config.footer.center) css += '  @bottom-center { content: ' + buildContentValue(config.footer.center) + '; }\n';
                 if (config.footer.right)  css += '  @bottom-right { content: '  + buildContentValue(config.footer.right) + '; }\n';

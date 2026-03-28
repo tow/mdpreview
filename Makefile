@@ -2,7 +2,7 @@ APP_NAME = MarkdownPreview
 SCHEME   = MarkdownPreview
 PROJECT  = MarkdownPreview.xcodeproj
 DERIVED  = $(HOME)/Library/Developer/Xcode/DerivedData
-BUILT    = $(shell find $(DERIVED) -name "$(APP_NAME).app" -path "*/Debug/*" 2>/dev/null | head -1)
+BUILT    = $(shell find $(DERIVED) -name "$(APP_NAME).app" -path "*/Debug/*" -print0 2>/dev/null | xargs -0 ls -dt 2>/dev/null | head -1)
 
 .PHONY: build install open clean
 

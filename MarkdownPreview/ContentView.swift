@@ -134,8 +134,8 @@ struct ContentView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.15), value: state.showSearch)
-                .toolbar {
-                    ToolbarItem {
+                .toolbar(id: "main") {
+                    ToolbarItem(id: "mode") {
                         Picker("Mode", selection: Binding(
                             get: { state.viewMode },
                             set: { newMode in
@@ -153,7 +153,7 @@ struct ContentView: View {
                         .pickerStyle(.segmented)
                         .help("Switch between Reading and Document mode")
                     }
-                    ToolbarItem {
+                    ToolbarItem(id: "search") {
                         Button {
                             withAnimation { state.showSearch.toggle() }
                             if !state.showSearch { state.searchText = "" }
@@ -161,7 +161,7 @@ struct ContentView: View {
                             Label("Find", systemImage: "magnifyingglass")
                         }
                     }
-                    ToolbarItem {
+                    ToolbarItem(id: "theme") {
                         Picker("Theme", selection: $state.currentTheme) {
                             ForEach(Theme.all) { theme in
                                 Text(theme.name).tag(theme)
@@ -170,21 +170,23 @@ struct ContentView: View {
                         .pickerStyle(.menu)
                         .help("Switch theme")
                     }
-                    if state.viewMode == .document {
-                        ToolbarItem {
-                            Button {
-                                state.viewPDF()
-                            } label: {
-                                Label("View PDF", systemImage: "doc.text.magnifyingglass")
-                            }
+                    ToolbarItem(id: "viewpdf") {
+                        Button {
+                            state.viewPDF()
+                        } label: {
+                            Label("View PDF", systemImage: "doc.text.magnifyingglass")
                         }
-                        ToolbarItem {
-                            Button {
-                                state.exportPDF()
-                            } label: {
-                                Label("Save PDF", systemImage: "arrow.down.doc")
-                            }
+                        .opacity(state.viewMode == .document ? 1 : 0)
+                        .disabled(state.viewMode != .document)
+                    }
+                    ToolbarItem(id: "savepdf") {
+                        Button {
+                            state.exportPDF()
+                        } label: {
+                            Label("Save PDF", systemImage: "arrow.down.doc")
                         }
+                        .opacity(state.viewMode == .document ? 1 : 0)
+                        .disabled(state.viewMode != .document)
                     }
                 }
             } else {

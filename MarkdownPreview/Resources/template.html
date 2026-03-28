@@ -3,9 +3,9 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link id="theme-link" rel="stylesheet" href="github-markdown.min.css">
-    <link id="code-theme-link" rel="stylesheet" href="highlight-github.min.css">
-    <style>
+    <link id="theme-link" rel="stylesheet" href="github-markdown.min.css" data-pagedjs-ignore>
+    <link id="code-theme-link" rel="stylesheet" href="highlight-github.min.css" data-pagedjs-ignore>
+    <style data-pagedjs-ignore>
         * { box-sizing: border-box; }
         body { margin: 0; padding: 24px 32px; }
         #content {
@@ -199,8 +199,8 @@
             document.querySelectorAll('#content pre code').forEach(function(block) {
                 hljs.highlightElement(block);
             });
-            // Inject @page CSS from config
-            injectPagedCSS(_currentConfig);
+            // Build @page CSS from config
+            var pagedCSS = buildPagedCSS(_currentConfig);
             // Wrap content so theme CSS selectors still match inside Paged.js pages
             var wrapperClass = isGithubTheme() ? 'markdown-body' : '';
             var logoHTML = '';
@@ -208,12 +208,19 @@
                 logoHTML = '<div id="running-logo"><img src="' + _currentConfig.logoBase64 + '"></div>';
             }
             var wrappedHTML = logoHTML + '<div id="content" class="' + wrapperClass + '">' + el.innerHTML + '</div>';
+            // Build stylesheet array for Paged.js
+            var stylesheets = [];
+            if (pagedCSS) {
+                var obj = {};
+                obj[window.location.href] = pagedCSS;
+                stylesheets.push(obj);
+            }
             // Run Paged.js
             try {
                 var paged = new Paged.Previewer();
                 var flow = await paged.preview(
                     wrappedHTML,
-                    [],
+                    stylesheets,
                     document.body
                 );
                 if (gen !== _paginationGen) return; // stale
@@ -230,12 +237,8 @@
             }
         }
 
-        function injectPagedCSS(config) {
-            // Remove old paged styles
-            var old = document.getElementById('paged-styles');
-            if (old) old.remove();
-
-            if (!config) return;
+        function buildPagedCSS(config) {
+            if (!config) return '';
 
             var m = config.margins || { top: 25, right: 20, bottom: 25, left: 20 };
             var size = config.pageSize || 'A4';
@@ -272,13 +275,7 @@
             css += 'img { break-inside: avoid; }\n';
             css += 'p { widows: 3; orphans: 3; }\n';
 
-            var style = document.createElement('style');
-            style.id = 'paged-styles';
-            style.textContent = css;
-            document.head.appendChild(style);
-
-            // Logo is injected into the content HTML passed to Paged.js
-            // (see paginate function) so it can be picked up as a running element
+            return css;
         }
 
         function buildContentValue(str) {

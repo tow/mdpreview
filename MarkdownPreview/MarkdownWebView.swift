@@ -25,9 +25,17 @@ struct MarkdownWebView: NSViewRepresentable {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         config.userContentController.add(context.coordinator, name: "paginationDone")
+        config.userContentController.add(context.coordinator, name: "consoleLog")
+        let consoleScript = WKUserScript(
+            source: "var _origLog = console.log; console.log = function() { var msg = Array.from(arguments).map(String).join(' '); _origLog.apply(console, arguments); window.webkit.messageHandlers.consoleLog.postMessage(msg); };",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(consoleScript)
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         context.coordinator.webView = webView
 
         if let resourcesURL = Bundle.main.resourceURL {
@@ -56,8 +64,8 @@ struct MarkdownWebView: NSViewRepresentable {
             coord.updateBaseURL(baseURL)
         }
 
-        // Content change
-        coord.render(markdownContent)
+        // Content change — also pass config so document mode always has it
+        coord.render(markdownContent, viewMode: viewMode, configJSON: pdfConfigJSON)
 
         // Theme change
         if theme.id != coord.lastThemeID {
@@ -90,7 +98,7 @@ struct MarkdownWebView: NSViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
         private var isLoaded = false
         private var pendingContent: String?
@@ -104,11 +112,15 @@ struct MarkdownWebView: NSViewRepresentable {
         var lastSearchBackwardTrigger: Int = 0
         var lastSearchText: String = ""
         var lastThemeID: String = ""
-        var lastViewModeTrigger: Int = 0
+        var lastViewModeTrigger: Int = -1
         var lastBaseURL: URL?
         var currentViewMode: ViewMode = .reading
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "consoleLog" {
+                print("[JS] \(message.body)")
+                return
+            }
             if message.name == "paginationDone" {
                 // Fade in the webview now that pagination is complete
                 guard let webView else { return }
@@ -289,10 +301,14 @@ struct MarkdownWebView: NSViewRepresentable {
             }
         }
 
-        func render(_ content: String) {
+        func render(_ content: String, viewMode: ViewMode = .reading, configJSON: String = "{}") {
             guard content != lastRenderedContent else { return }
             lastRenderedContent = content
             if isLoaded {
+                // Ensure JS has the current config before rendering
+                if viewMode == .document {
+                    webView?.evaluateJavaScript("_currentConfig = \(configJSON)", completionHandler: nil)
+                }
                 evaluateRender(content)
             } else {
                 pendingContent = content

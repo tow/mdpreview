@@ -188,6 +188,8 @@ struct MarkdownWebView: NSViewRepresentable {
             // Hide webview at the native layer to prevent any flash
             webView.alphaValue = 0
             if mode == .reading {
+                // Allow OS appearance (dark mode) in reading view
+                webView.appearance = nil
                 let js = "setViewMode('reading', null)"
                 webView.evaluateJavaScript(js) { _, _ in
                     // Reading mode is synchronous — restore immediately
@@ -197,6 +199,8 @@ struct MarkdownWebView: NSViewRepresentable {
                     }
                 }
             } else {
+                // Force light appearance so prefers-color-scheme: dark never matches
+                webView.appearance = NSAppearance(named: .aqua)
                 // Document mode: JS will post paginationDone message when ready
                 let js = "setViewMode('document', \(configJSON))"
                 webView.evaluateJavaScript(js, completionHandler: nil)

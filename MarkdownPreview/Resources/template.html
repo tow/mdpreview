@@ -47,17 +47,17 @@
         }
 
         @media (prefers-color-scheme: dark) {
-            #content th,
-            #content td {
+            html:not([data-theme=light]) #content th,
+            html:not([data-theme=light]) #content td {
                 border-color: #30363d;
             }
-            #content th {
+            html:not([data-theme=light]) #content th {
                 background-color: #21262d;
             }
-            #content tr:nth-child(even) td {
+            html:not([data-theme=light]) #content tr:nth-child(even) td {
                 background-color: #161b22;
             }
-            #content tr:hover td {
+            html:not([data-theme=light]) #content tr:hover td {
                 background-color: #1c2128;
             }
         }
@@ -185,6 +185,10 @@
             var gen = ++_paginationGen;
             // Hide during transition (class may already be set by setViewMode)
             document.body.classList.add('paginating');
+            // Force light mode for document/PDF view
+            document.documentElement.style.colorScheme = 'light';
+            document.documentElement.setAttribute('data-theme', 'light');
+            document.body.style.background = '#f0f0f0';
             // Clean up previous Paged.js output
             removePagedDOM();
             // Ensure content div exists
@@ -330,6 +334,7 @@
             if (mode === 'reading') {
                 // Allow dark mode in reading view
                 document.documentElement.style.colorScheme = '';
+                document.documentElement.removeAttribute('data-theme');
                 removePagedDOM();
                 document.body.style.padding = '24px 32px';
                 document.body.style.background = '';
@@ -338,6 +343,7 @@
             } else {
                 // Force light mode for document/PDF view
                 document.documentElement.style.colorScheme = 'light';
+                document.documentElement.setAttribute('data-theme', 'light');
                 document.body.style.padding = '0';
                 document.body.style.background = '#f0f0f0';
                 paginate();

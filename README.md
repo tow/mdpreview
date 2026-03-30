@@ -1,16 +1,24 @@
 # MarkdownPreview
 
-A native macOS app for previewing and exporting Markdown files. Features a file tree navigator, live preview with multiple themes, and PDF export with configurable page layout.
+A lightweight macOS Markdown viewer that auto-refreshes when files change on disk.
+
+## Why this exists
+
+Claude Code is great for working with text documents, and Markdown is a natural output format — but proofreading rendered Markdown is a pain. Reading raw markup in the terminal is rough. Opening an IDE is heavyweight and brings in a lot of noise. Something like Obsidian can render it, but presupposes a whole vault structure when you just want to view one file. And most of these tools won't automatically update when an external process edits the file.
+
+MarkdownPreview fills that gap: a viewer you can leave open on one side of your screen while you work in a terminal on the other. When Claude (or anything else) writes to a `.md` file, the preview updates immediately. No manual reload, no project scaffolding, no overhead.
+
+Pair it with PDF export and configurable templates, and you can go from a rough draft to print-ready professional output in one sitting.
 
 ## Features
 
-- **File tree navigation** — browse directories and select Markdown files
+- **Auto-reload** — watches files for changes and refreshes the preview instantly
+- **File tree navigation** — browse directories and select Markdown files from a sidebar
 - **Live preview** — rendered in WebKit with 6 built-in themes (GitHub, Water, Sakura, Simple, Splendor, Air)
-- **PDF export** — configurable page size, margins, headers/footers, and logo embedding
-- **Document mode** — print-optimized layout using Paged.js for paginated preview
+- **Document mode** — print-optimized paginated layout using Paged.js, with headers, footers, and logo placement
+- **PDF export** — configurable page size, margins, headers/footers, and company branding
 - **Find in document** — Cmd+F search with forward/backward navigation
-- **Auto-reload** — watches files for changes and refreshes automatically
-- **Syntax highlighting** — code blocks highlighted with Highlight.js
+- **Syntax highlighting** — code blocks highlighted via Highlight.js
 
 ## Requirements
 

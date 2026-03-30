@@ -174,7 +174,7 @@ struct ContentView: View {
                         Button {
                             state.viewPDF()
                         } label: {
-                            Label("View PDF", systemImage: "doc.text.magnifyingglass")
+                            Label("View PDF", systemImage: "eye.fill")
                         }
                         .opacity(state.viewMode == .document ? 1 : 0)
                         .disabled(state.viewMode != .document)

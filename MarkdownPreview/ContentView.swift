@@ -10,6 +10,7 @@ final class AppState: ObservableObject {
     @Published var markdownContent: String = ""
     @Published var exportPDFTrigger: Int = 0
     @Published var viewPDFTrigger: Int = 0
+    @Published var printTrigger: Int = 0
     @Published var currentTheme: Theme = Theme.all[0]
     @Published var showSearch: Bool = false
     @Published var searchText: String = ""
@@ -21,6 +22,7 @@ final class AppState: ObservableObject {
 
     func exportPDF() { exportPDFTrigger += 1 }
     func viewPDF() { viewPDFTrigger += 1 }
+    func printDocument() { printTrigger += 1 }
     func findNext() { searchForwardTrigger += 1 }
     func findPrevious() { searchBackwardTrigger += 1 }
 
@@ -62,6 +64,9 @@ final class AppState: ObservableObject {
         }
         NotificationCenter.default.addObserver(forName: .showSearch, object: nil, queue: .main) { [weak self] _ in
             self?.showSearch = true
+        }
+        NotificationCenter.default.addObserver(forName: .printDocument, object: nil, queue: .main) { [weak self] _ in
+            self?.printDocument()
         }
         // Pick up a file passed at launch. Deferred so didSet fires after init completes.
         if let delegate = NSApp.delegate as? AppDelegate, let url = delegate.pendingURL {
@@ -110,6 +115,7 @@ struct ContentView: View {
                         markdownContent: state.markdownContent,
                         exportTrigger: state.exportPDFTrigger,
                         viewPDFTrigger: state.viewPDFTrigger,
+                        printTrigger: state.printTrigger,
                         exportFilename: state.selectedFile?.deletingPathExtension().lastPathComponent ?? "document",
                         theme: state.currentTheme,
                         searchText: state.searchText,
@@ -187,6 +193,13 @@ struct ContentView: View {
                         }
                         .opacity(state.viewMode == .document ? 1 : 0)
                         .disabled(state.viewMode != .document)
+                    }
+                    ToolbarItem(id: "print") {
+                        Button {
+                            state.printDocument()
+                        } label: {
+                            Label("Print", systemImage: "printer")
+                        }
                     }
                 }
             } else {

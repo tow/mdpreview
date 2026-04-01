@@ -7,6 +7,7 @@ struct MarkdownWebView: NSViewRepresentable {
     let markdownContent: String
     let exportTrigger: Int
     let viewPDFTrigger: Int
+    let printTrigger: Int
     var exportFilename: String = "document"
     var theme: Theme = Theme.all[0]
     var searchText: String = ""
@@ -82,6 +83,10 @@ struct MarkdownWebView: NSViewRepresentable {
             coord.lastViewPDFTrigger = viewPDFTrigger
             coord.viewPDF(filename: exportFilename)
         }
+        if printTrigger != coord.lastPrintTrigger {
+            coord.lastPrintTrigger = printTrigger
+            coord.printDocument()
+        }
 
         // Search triggers
         if searchForwardTrigger != coord.lastSearchForwardTrigger {
@@ -108,6 +113,7 @@ struct MarkdownWebView: NSViewRepresentable {
         private var pendingBaseURL: URL?
         var lastExportTrigger: Int = 0
         var lastViewPDFTrigger: Int = 0
+        var lastPrintTrigger: Int = 0
         var lastSearchForwardTrigger: Int = 0
         var lastSearchBackwardTrigger: Int = 0
         var lastSearchText: String = ""
@@ -229,6 +235,17 @@ struct MarkdownWebView: NSViewRepresentable {
                     .appendingPathComponent(filename + ".pdf")
                 try? data.write(to: url)
                 NSWorkspace.shared.open(url)
+            }
+        }
+
+        func printDocument() {
+            guard let webView else { return }
+            capturePagedPDF(webView: webView) { data in
+                guard let data, let pdfDoc = PDFDocument(data: data) else { return }
+                let printOp = pdfDoc.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true)
+                printOp?.showsPrintPanel = true
+                printOp?.showsProgressPanel = true
+                printOp?.run()
             }
         }
 

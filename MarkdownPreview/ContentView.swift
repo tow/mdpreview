@@ -46,21 +46,22 @@ final class AppState: ObservableObject {
     private let watcher = FileWatcher()
     private let defaultRootURL = URL(fileURLWithPath:
         ProcessInfo.processInfo.environment["MDPREVIEW_ROOT"]
-            ?? FileManager.default.homeDirectoryForCurrentUser.path
+            ?? FileManager.default.currentDirectoryPath
     )
 
     init() {
-        rootDirectoryName = defaultRootURL.lastPathComponent
-        rootNodes = FileNode.loadChildren(of: defaultRootURL)
+        // Each window claims one file from the queue
+        if let delegate = AppDelegate.shared, let url = delegate.claimNextURL() {
+            let dir = url.deletingLastPathComponent()
+            rootDirectoryName = dir.lastPathComponent
+            rootNodes = FileNode.loadChildren(of: dir)
+            _claimedURL = url
+        } else {
+            rootDirectoryName = defaultRootURL.lastPathComponent
+            rootNodes = FileNode.loadChildren(of: defaultRootURL)
+        }
         watcher.onChange = { [weak self] in
             self?.reloadCurrentFile()
-        }
-        NotificationCenter.default.addObserver(
-            forName: .openMarkdownFile, object: nil, queue: .main
-        ) { [weak self] note in
-            if let url = note.object as? URL {
-                self?.openFile(url)
-            }
         }
         NotificationCenter.default.addObserver(forName: .showSearch, object: nil, queue: .main) { [weak self] _ in
             self?.showSearch = true
@@ -68,12 +69,12 @@ final class AppState: ObservableObject {
         NotificationCenter.default.addObserver(forName: .printDocument, object: nil, queue: .main) { [weak self] _ in
             self?.printDocument()
         }
-        // Pick up a file passed at launch. Deferred so didSet fires after init completes.
-        if let delegate = NSApp.delegate as? AppDelegate, let url = delegate.pendingURL {
-            delegate.pendingURL = nil
-            DispatchQueue.main.async { self.openFile(url) }
+        // Deferred so didSet fires after init completes
+        if let url = _claimedURL {
+            DispatchQueue.main.async { self.selectedFile = url }
         }
     }
+    private var _claimedURL: URL?
 
     func openFile(_ url: URL) {
         let dir = url.deletingLastPathComponent()
@@ -103,6 +104,9 @@ final class AppState: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var state = AppState()
+    @Environment(\.openWindow) private var openWindow
+    @MainActor private static var hasCreatedExtraWindows = false
+    @MainActor private static var isProcessingQueue = false
 
     var body: some View {
         NavigationSplitView {
@@ -200,6 +204,8 @@ struct ContentView: View {
                         } label: {
                             Label("Print", systemImage: "printer")
                         }
+                        .opacity(state.viewMode == .document ? 1 : 0)
+                        .disabled(state.viewMode != .document)
                     }
                 }
             } else {
@@ -211,5 +217,27 @@ struct ContentView: View {
             }
         }
         .navigationTitle(state.selectedFile?.lastPathComponent ?? "MarkdownPreview")
+        .onAppear {
+            guard !Self.hasCreatedExtraWindows else { return }
+            Self.hasCreatedExtraWindows = true
+            if let delegate = AppDelegate.shared {
+                for _ in 0..<delegate.remainingURLCount {
+                    openWindow(id: "main")
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .processFileQueue)) { _ in
+            guard !Self.isProcessingQueue else { return }
+            Self.isProcessingQueue = true
+            if let delegate = AppDelegate.shared {
+                if state.selectedFile == nil, let url = delegate.claimNextURL() {
+                    state.openFile(url)
+                }
+                for _ in 0..<delegate.remainingURLCount {
+                    openWindow(id: "main")
+                }
+            }
+            DispatchQueue.main.async { Self.isProcessingQueue = false }
+        }
     }
 }

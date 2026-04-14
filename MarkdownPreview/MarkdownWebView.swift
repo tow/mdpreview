@@ -239,7 +239,7 @@ struct MarkdownWebView: NSViewRepresentable {
         }
 
         func printDocument() {
-            guard let webView else { return }
+            guard let webView, currentViewMode == .document else { return }
             capturePagedPDF(webView: webView) { data in
                 guard let data, let pdfDoc = PDFDocument(data: data) else { return }
                 let printOp = pdfDoc.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true)

@@ -5,11 +5,12 @@ struct MarkdownPreviewApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("MarkdownPreview", id: "main") {
             ContentView()
         }
         .defaultSize(width: 1200, height: 800)
         .commands {
+            CommandGroup(replacing: .newItem) { }
             CommandGroup(replacing: .printItem) {
                 Button("Print…") {
                     NotificationCenter.default.post(name: .printDocument, object: nil)

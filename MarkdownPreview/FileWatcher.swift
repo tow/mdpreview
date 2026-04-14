@@ -14,12 +14,10 @@ final class FileWatcher {
     }
 
     func stop() {
+        // Cancel handler closes the fd; don't close it here or we race.
         source?.cancel()
         source = nil
-        if fileDescriptor >= 0 {
-            close(fileDescriptor)
-            fileDescriptor = -1
-        }
+        fileDescriptor = -1
         watchedURL = nil
     }
 
@@ -41,10 +39,11 @@ final class FileWatcher {
                 if flags.contains(.write) {
                     self.onChange?()
                 } else {
-                    // rename/delete — editor may have replaced the file; re-establish watch
+                    // rename/delete — editor may have replaced the file; re-establish watch.
+                    // Don't close fd manually; the cancel handler owns it. Closing here
+                    // races with the async cancel handler and can close a freshly-opened fd.
                     self.source?.cancel()
                     self.source = nil
-                    close(self.fileDescriptor)
                     self.fileDescriptor = -1
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                         guard let url = self.watchedURL else { return }
@@ -65,6 +64,5 @@ final class FileWatcher {
 
     deinit {
         source?.cancel()
-        if fileDescriptor >= 0 { close(fileDescriptor) }
     }
 }

@@ -31,10 +31,10 @@
         <dict>
             <key>CFBundleTypeName</key>
             <string>Markdown File</string>
-            <key>LSItemContentTypes</key>
+            <key>CFBundleTypeExtensions</key>
             <array>
-                <string>net.daringfireball.markdown</string>
-                <string>public.plain-text</string>
+                <string>md</string>
+                <string>markdown</string>
             </array>
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>

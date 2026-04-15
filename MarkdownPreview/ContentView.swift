@@ -49,9 +49,8 @@ final class AppState: ObservableObject {
             ?? FileManager.default.currentDirectoryPath
     )
 
-    init() {
-        // Each window claims one file from the queue
-        if let delegate = AppDelegate.shared, let url = delegate.claimNextURL() {
+    init(initialURL: URL? = nil) {
+        if let url = initialURL {
             let dir = url.deletingLastPathComponent()
             rootDirectoryName = dir.lastPathComponent
             rootNodes = FileNode.loadChildren(of: dir)
@@ -103,10 +102,12 @@ final class AppState: ObservableObject {
 }
 
 struct ContentView: View {
-    @StateObject private var state = AppState()
+    @StateObject private var state: AppState
     @Environment(\.openWindow) private var openWindow
-    @MainActor private static var hasCreatedExtraWindows = false
-    @MainActor private static var isProcessingQueue = false
+
+    init(initialURL: URL? = nil) {
+        _state = StateObject(wrappedValue: AppState(initialURL: initialURL))
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -217,27 +218,5 @@ struct ContentView: View {
             }
         }
         .navigationTitle(state.selectedFile?.lastPathComponent ?? "MarkdownPreview")
-        .onAppear {
-            guard !Self.hasCreatedExtraWindows else { return }
-            Self.hasCreatedExtraWindows = true
-            if let delegate = AppDelegate.shared {
-                for _ in 0..<delegate.remainingURLCount {
-                    openWindow(id: "main")
-                }
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .processFileQueue)) { _ in
-            guard !Self.isProcessingQueue else { return }
-            Self.isProcessingQueue = true
-            if let delegate = AppDelegate.shared {
-                if state.selectedFile == nil, let url = delegate.claimNextURL() {
-                    state.openFile(url)
-                }
-                for _ in 0..<delegate.remainingURLCount {
-                    openWindow(id: "main")
-                }
-            }
-            DispatchQueue.main.async { Self.isProcessingQueue = false }
-        }
     }
 }

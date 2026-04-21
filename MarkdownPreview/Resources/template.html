@@ -102,9 +102,33 @@
             opacity: 0 !important;
             pointer-events: none !important;
         }
+
+        /* Mermaid diagram containers: center, constrain, keep together across page breaks */
+        .mermaid-diagram {
+            display: flex;
+            justify-content: center;
+            margin: 1.25em 0;
+            break-inside: avoid;
+        }
+        .mermaid-diagram svg {
+            max-width: 100%;
+            height: auto;
+        }
+        .mermaid-error {
+            border: 1px solid #d0606e;
+            background: #fff5f5;
+            color: #8a1a1a;
+            padding: 10px 14px;
+            border-radius: 4px;
+            margin: 1.25em 0;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.85em;
+            white-space: pre-wrap;
+        }
     </style>
     <script src="marked.min.js"></script>
     <script src="highlight.min.js"></script>
+    <script src="mermaid.min.js"></script>
     <script>window.PagedConfig = { auto: false };</script>
     <script src="paged.polyfill.js"></script>
     <script>
@@ -125,6 +149,51 @@
         var _paginationGen = 0;
         var _debounceTimer = null;
         var _baseURL = '';
+        var _mermaidCounter = 0;
+
+        function mermaidTheme() {
+            // Force default theme in document/PDF mode (matches force-light behavior);
+            // otherwise follow OS appearance.
+            if (_currentMode === 'document') return 'default';
+            return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark' : 'default';
+        }
+
+        async function processMermaid(container) {
+            var blocks = container.querySelectorAll('pre > code.language-mermaid');
+            if (!blocks.length) return;
+            mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: mermaidTheme() });
+            for (var i = 0; i < blocks.length; i++) {
+                var code = blocks[i];
+                var pre = code.parentElement;
+                var src = code.textContent;
+                var id = 'mermaid-' + (++_mermaidCounter);
+                var wrap = document.createElement('div');
+                wrap.className = 'mermaid-diagram';
+                var ok = false;
+                try {
+                    // parse() with suppressErrors returns false on syntax errors
+                    // instead of throwing *and* injecting a debug SVG into the DOM.
+                    ok = !!(await mermaid.parse(src, { suppressErrors: true }));
+                } catch (_) { ok = false; }
+                if (ok) {
+                    try {
+                        var result = await mermaid.render(id, src);
+                        wrap.innerHTML = result.svg;
+                        if (result.bindFunctions) result.bindFunctions(wrap);
+                    } catch (e) {
+                        ok = false;
+                    }
+                }
+                if (!ok) {
+                    wrap.className = 'mermaid-error';
+                    wrap.textContent = 'Mermaid syntax error in block:\n\n' + src.trim();
+                }
+                pre.parentNode.replaceChild(wrap, pre);
+            }
+            // Mermaid can leave behind orphan containers from failed renders.
+            document.querySelectorAll('body > div[id^="dmermaid-"], body > iframe[id^="mermaid-"]').forEach(function(el){ el.remove(); });
+        }
 
         function setBaseURL(url) {
             _baseURL = url;
@@ -156,7 +225,7 @@
             }
         }
 
-        function renderReading() {
+        async function renderReading() {
             var el = document.getElementById('content');
             if (!el) {
                 // Rebuild content div if Paged.js destroyed it
@@ -168,10 +237,11 @@
             el.innerHTML = marked.parse(preprocessImages(_rawMarkdown));
             el.className = isGithubTheme() ? 'markdown-body' : '';
             resolveRelativePaths(el);
-            document.querySelectorAll('#content pre code').forEach(function(block) {
+            document.querySelectorAll('#content pre code:not(.language-mermaid)').forEach(function(block) {
                 hljs.highlightElement(block);
             });
             window.scrollTo(0, scrollTop);
+            await processMermaid(el);
         }
 
         function debouncePaginate() {
@@ -202,9 +272,11 @@
             el.innerHTML = marked.parse(preprocessImages(_rawMarkdown));
             el.className = isGithubTheme() ? 'markdown-body' : '';
             resolveRelativePaths(el);
-            document.querySelectorAll('#content pre code').forEach(function(block) {
+            document.querySelectorAll('#content pre code:not(.language-mermaid)').forEach(function(block) {
                 hljs.highlightElement(block);
             });
+            await processMermaid(el);
+            if (gen !== _paginationGen) return; // stale
             // Build @page CSS from config
             var pagedCSS = buildPagedCSS(_currentConfig);
             // Wrap content so theme CSS selectors still match inside Paged.js pages

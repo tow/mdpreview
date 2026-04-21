@@ -26,6 +26,7 @@
 		AFA18BF392375F47A8337928 /* theme-splendor.css in Resources */ = {isa = PBXBuildFile; fileRef = 94715AA9B1842651F1505167 /* theme-splendor.css */; };
 		BC1E2DAE35DAD3ADFDD4052E /* highlight-dark.min.css in Resources */ = {isa = PBXBuildFile; fileRef = 1C76BBB05A018683C9F0026E /* highlight-dark.min.css */; };
 		BFB7DC15374B6EE5D0919D8D /* marked.min.js in Resources */ = {isa = PBXBuildFile; fileRef = 891CC7C57A89105476DB9567 /* marked.min.js */; };
+		AA11B2C3D4E5F6789012ABCD /* mermaid.min.js in Resources */ = {isa = PBXBuildFile; fileRef = BB11B2C3D4E5F6789012ABCD /* mermaid.min.js */; };
 		C2729CAC2BFF378915578566 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 98B4CF73E08C9AC801562524 /* Assets.xcassets */; };
 		C6D2765D12C8DF4236D70ADB /* paged.polyfill.js in Resources */ = {isa = PBXBuildFile; fileRef = 4EAC64C2EA15DF290258EA8E /* paged.polyfill.js */; };
 		CEFEFA9537D799FB62E6865F /* theme-water.css in Resources */ = {isa = PBXBuildFile; fileRef = B445FF4106D436D045EB0D56 /* theme-water.css */; };
@@ -50,6 +51,7 @@
 		7C7B63F08A2B93A483AF6621 /* SearchBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchBar.swift; sourceTree = "<group>"; };
 		7EE7811897FE305506D51DEB /* MarkdownWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownWebView.swift; sourceTree = "<group>"; };
 		891CC7C57A89105476DB9567 /* marked.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = marked.min.js; sourceTree = "<group>"; };
+		BB11B2C3D4E5F6789012ABCD /* mermaid.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = mermaid.min.js; sourceTree = "<group>"; };
 		8B90C8ABE7E91B78E0CB07EB /* theme-sakura.css */ = {isa = PBXFileReference; lastKnownFileType = text.css; path = "theme-sakura.css"; sourceTree = "<group>"; };
 		94715AA9B1842651F1505167 /* theme-splendor.css */ = {isa = PBXFileReference; lastKnownFileType = text.css; path = "theme-splendor.css"; sourceTree = "<group>"; };
 		98B4CF73E08C9AC801562524 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -99,6 +101,7 @@
 				5226A21A3C45F8787AA57AB3 /* highlight-github.min.css */,
 				1F29E72DA2E4BCF068568787 /* highlight.min.js */,
 				891CC7C57A89105476DB9567 /* marked.min.js */,
+				BB11B2C3D4E5F6789012ABCD /* mermaid.min.js */,
 				4EAC64C2EA15DF290258EA8E /* paged.polyfill.js */,
 				9E7271B43A08D234CE444F4C /* template.html */,
 				C2BACE1586D6F02AEA4564A3 /* theme-air.css */,
@@ -182,6 +185,7 @@
 				797D6EB7AF29535BA8B6A4EA /* highlight-github.min.css in Resources */,
 				0450DAEB178E050DC8D8D0FC /* highlight.min.js in Resources */,
 				BFB7DC15374B6EE5D0919D8D /* marked.min.js in Resources */,
+				AA11B2C3D4E5F6789012ABCD /* mermaid.min.js in Resources */,
 				C6D2765D12C8DF4236D70ADB /* paged.polyfill.js in Resources */,
 				81654B92A413E0211DE183FF /* template.html in Resources */,
 				9841B925028B21225FDD3E66 /* theme-air.css in Resources */,

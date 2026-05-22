@@ -125,12 +125,43 @@
             font-size: 0.85em;
             white-space: pre-wrap;
         }
+
+        /* Editing: keep the per-block wrappers transparent to layout. */
+        #content .seg { outline: none; }
+        #content .seg[contenteditable="true"]:focus { outline: none; }
+
+        /* Blocking conflict overlay */
+        .conflict-panel {
+            border: 1px solid #d9a441;
+            background: #fffbf0;
+            border-radius: 6px;
+            margin: 0.75em 0;
+            padding: 10px 12px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            font-size: 13px;
+        }
+        .conflict-title { font-weight: 600; color: #8a5a00; margin-bottom: 8px; }
+        .conflict-cols { display: flex; gap: 10px; }
+        .conflict-col { flex: 1; min-width: 0; }
+        .conflict-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #777; margin-bottom: 4px; }
+        .conflict-panel pre {
+            margin: 0; padding: 8px; background: #fff; border: 1px solid #e3e3e3; border-radius: 4px;
+            white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+        }
+        .conflict-disk { border-color: #bcd6bc !important; }
+        .conflict-actions { margin-top: 8px; display: flex; gap: 8px; }
+        .conflict-actions button {
+            font-size: 12px; padding: 4px 12px; border-radius: 5px; border: 1px solid #c5c5c5;
+            background: #f5f5f5; cursor: pointer;
+        }
+        .conflict-actions button[data-act="mine"] { background: #2f6fdb; border-color: #2f6fdb; color: #fff; }
     </style>
     <script src="marked.min.js"></script>
     <script src="highlight.min.js"></script>
     <script src="mermaid.min.js"></script>
     <script>window.PagedConfig = { auto: false };</script>
     <script src="paged.polyfill.js"></script>
+    <script src="editor-core.js"></script>
     <script>
         marked.use({ gfm: true, breaks: false });
 
@@ -150,6 +181,15 @@
         var _debounceTimer = null;
         var _baseURL = '';
         var _mermaidCounter = 0;
+
+        // --- In-place editing state ---
+        var _segments = [];          // EditorCore.segment() output; raw join === file
+        var _baseMarkdown = '';      // last version common to disk + view (for 3-way merge)
+        var _saveTimer = null;       // debounce for autosave
+        var _conflicts = [];         // open blocking conflicts (suspends autosave)
+        var _undoStack = [];         // our own undo (native undo bypasses source mutations)
+        var _redoStack = [];
+        var _listenersBound = false;
 
         function mermaidTheme() {
             // Force default theme in document/PDF mode (matches force-light behavior);
@@ -217,7 +257,10 @@
         }
 
         function renderMarkdown(md) {
+            // A full (re)load from Swift establishes a new common base for merges.
             _rawMarkdown = md;
+            _baseMarkdown = md;
+            _conflicts = [];
             if (_currentMode === 'reading') {
                 renderReading();
             } else {
@@ -226,22 +269,38 @@
         }
 
         async function renderReading() {
-            var el = document.getElementById('content');
-            if (!el) {
+            var content = document.getElementById('content');
+            if (!content) {
                 // Rebuild content div if Paged.js destroyed it
-                el = document.createElement('div');
-                el.id = 'content';
-                document.body.appendChild(el);
+                content = document.createElement('div');
+                content.id = 'content';
+                document.body.appendChild(content);
             }
             var scrollTop = window.scrollY;
-            el.innerHTML = marked.parse(preprocessImages(_rawMarkdown));
-            el.className = isGithubTheme() ? 'markdown-body' : '';
-            resolveRelativePaths(el);
-            document.querySelectorAll('#content pre code:not(.language-mermaid)').forEach(function(block) {
+            // Segmented render: one editable <div data-seg> per top-level block,
+            // so edits can be folded back into just that block's source. `space`
+            // separators stay in _segments (for reassembly) but aren't rendered.
+            _segments = EditorCore.segment(_rawMarkdown, marked);
+            content.className = isGithubTheme() ? 'markdown-body' : '';
+            content.innerHTML = '';
+            var editing = (_currentMode === 'reading' && _conflicts.length === 0);
+            _segments.forEach(function(seg, i) {
+                if (seg.type === 'space') return;
+                var div = document.createElement('div');
+                div.className = 'seg';
+                div.setAttribute('data-seg', String(i));
+                div.setAttribute('contenteditable', (editing && seg.editable) ? 'true' : 'false');
+                div.innerHTML = marked.parse(preprocessImages(seg.raw));
+                content.appendChild(div);
+            });
+            resolveRelativePaths(content);
+            content.querySelectorAll('pre code:not(.language-mermaid)').forEach(function(block) {
                 hljs.highlightElement(block);
             });
             window.scrollTo(0, scrollTop);
-            await processMermaid(el);
+            await processMermaid(content);
+            bindEditingListeners(content);
+            if (_conflicts.length) renderConflicts(content);
         }
 
         function debouncePaginate() {
@@ -440,6 +499,279 @@
         function isGithubTheme() {
             var link = document.getElementById('theme-link');
             return link && link.href.indexOf('github') !== -1;
+        }
+
+        // ===================== In-place editing =====================
+
+        function contentEl() { return document.getElementById('content'); }
+        function currentMarkdown() { return _segments.map(function(s){ return s.raw; }).join(''); }
+        function priorLen(i) { var n = 0; for (var k = 0; k < i; k++) n += _segments[k].raw.length; return n; }
+
+        function segDivFor(node) {
+            var content = contentEl();
+            while (node && node !== content) {
+                if (node.nodeType === 1 && node.getAttribute && node.getAttribute('data-seg') !== null) return node;
+                node = node.parentNode;
+            }
+            return null;
+        }
+        function segIndexOf(div) { return parseInt(div.getAttribute('data-seg'), 10); }
+
+        function relexSeg(seg) {
+            var re = EditorCore.segment(seg.raw, marked);
+            if (re.length === 1) { seg.token = re[0].token; seg.type = re[0].type; seg.editable = re[0].editable; }
+        }
+
+        function renderSeg(div, seg) {
+            div.innerHTML = marked.parse(preprocessImages(seg.raw));
+            resolveRelativePaths(div);
+            div.querySelectorAll('pre code:not(.language-mermaid)').forEach(function(b){ hljs.highlightElement(b); });
+        }
+
+        // Fold pending text edits in `div` back into its source, without touching
+        // the DOM. Returns false if the edit changed inline structure (then it's
+        // not a clean leaf substitution and the caller restores the block).
+        function flushSegment(div) {
+            var i = segIndexOf(div), seg = _segments[i];
+            if (!seg) return true;
+            var res = EditorCore.readEditsFromDom(div, seg.token);
+            if (!res.clean) return false;
+            if (res.edits.size > 0) { seg.raw = EditorCore.applyLeafEdits(seg, res.edits); relexSeg(seg); }
+            return true;
+        }
+
+        function setCaretSource(div, seg, srcOffset) {
+            var pos = EditorCore.sourceOffsetToDom(div, srcOffset, seg.token);
+            if (!pos.node) return;
+            var sel = window.getSelection(), r = document.createRange();
+            r.setStart(pos.node, pos.offset); r.collapse(true);
+            sel.removeAllRanges(); sel.addRange(r);
+        }
+        function setSelectionSource(div, seg, a, b) {
+            var pa = EditorCore.sourceOffsetToDom(div, a, seg.token);
+            var pb = EditorCore.sourceOffsetToDom(div, b, seg.token);
+            if (!pa.node || !pb.node) return;
+            var sel = window.getSelection(), r = document.createRange();
+            r.setStart(pa.node, pa.offset); r.setEnd(pb.node, pb.offset);
+            sel.removeAllRanges(); sel.addRange(r);
+        }
+
+        function pushUndo() {
+            _undoStack.push(currentMarkdown());
+            if (_undoStack.length > 200) _undoStack.shift();
+            _redoStack = [];
+        }
+        function undo() {
+            if (!_undoStack.length) return;
+            _redoStack.push(currentMarkdown());
+            _rawMarkdown = _undoStack.pop();
+            renderReading(); scheduleSave();
+        }
+        function redo() {
+            if (!_redoStack.length) return;
+            _undoStack.push(currentMarkdown());
+            _rawMarkdown = _redoStack.pop();
+            renderReading(); scheduleSave();
+        }
+
+        function atBlockStart(sel, div) {
+            if (!sel.isCollapsed) return false;
+            var seg = _segments[segIndexOf(div)];
+            return EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token) === 0;
+        }
+
+        function onBeforeInput(e) {
+            if (_currentMode !== 'reading' || _conflicts.length) return;
+            if (e.isComposing) return;
+            var sel = window.getSelection();
+            if (!sel.rangeCount) return;
+            var div = segDivFor(sel.anchorNode);
+            if (!div) { e.preventDefault(); return; }
+            var t = e.inputType;
+            if (t === 'insertText' || t === 'insertReplacementText' || t === 'insertCompositionText') { scheduleSave(); return; }
+            if (t.indexOf('delete') === 0) {
+                if (t === 'deleteContentBackward' && atBlockStart(sel, div) && segIndexOf(div) > 0) { e.preventDefault(); doMerge(div); return; }
+                scheduleSave(); return;
+            }
+            if (t === 'formatBold') { e.preventDefault(); doEmphasis(div, 'strong'); return; }
+            if (t === 'formatItalic') { e.preventDefault(); doEmphasis(div, 'em'); return; }
+            if (t === 'insertParagraph' || t === 'insertLineBreak') { e.preventDefault(); doSplit(div); return; }
+            if (t === 'historyUndo') { e.preventDefault(); undo(); return; }
+            if (t === 'historyRedo') { e.preventDefault(); redo(); return; }
+            e.preventDefault(); // out of vocabulary (lists, hr, colour, drop, paste handled below)
+        }
+
+        function onPaste(e) {
+            if (_currentMode !== 'reading' || _conflicts.length) return;
+            var sel = window.getSelection();
+            if (!sel.rangeCount || !segDivFor(sel.anchorNode)) return;
+            e.preventDefault();
+            var text = (e.clipboardData || window.clipboardData).getData('text/plain') || '';
+            document.execCommand('insertText', false, text.replace(/\r?\n+/g, ' '));
+            scheduleSave();
+        }
+
+        function doEmphasis(div, kind) {
+            if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
+            var sel = window.getSelection();
+            if (!sel.rangeCount) return;
+            var r = sel.getRangeAt(0);
+            if (segDivFor(r.startContainer) !== segDivFor(r.endContainer)) return; // single-block only
+            var seg = _segments[segIndexOf(div)];
+            // Range start/end are already in document order; bias each so the
+            // selection stays inside any emphasis run it sits within.
+            var a = EditorCore.domOffsetToSourceOffset(div, r.startContainer, r.startOffset, seg.token, 'start');
+            var b = EditorCore.domOffsetToSourceOffset(div, r.endContainer, r.endOffset, seg.token, 'end');
+            var res = EditorCore.toggleEmphasis(seg.raw, a, b, kind, marked);
+            if (!res) return;
+            pushUndo();
+            seg.raw = res.md; relexSeg(seg); renderSeg(div, seg);
+            setSelectionSource(div, seg, res.selStart, res.selEnd);
+            scheduleSave();
+        }
+
+        function doSplit(div) {
+            if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
+            var i = segIndexOf(div), seg = _segments[i];
+            var sel = window.getSelection();
+            var local = EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token);
+            var res = EditorCore.splitBlock(seg.raw, local, marked);
+            pushUndo();
+            var globalCaret = priorLen(i) + res.caret;
+            seg.raw = res.md;
+            _rawMarkdown = currentMarkdown();
+            renderReading();
+            restoreGlobalCaret(globalCaret);
+            scheduleSave();
+        }
+
+        function doMerge(div) {
+            if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
+            var globalStart = priorLen(segIndexOf(div));
+            var res = EditorCore.mergeBlock(currentMarkdown(), globalStart, marked);
+            pushUndo();
+            _rawMarkdown = res.md;
+            renderReading();
+            restoreGlobalCaret(res.caret);
+            scheduleSave();
+        }
+
+        // Place the caret at a document-global source offset after a full re-render.
+        function restoreGlobalCaret(globalOffset) {
+            var acc = 0;
+            for (var i = 0; i < _segments.length; i++) {
+                var seg = _segments[i], end = acc + seg.raw.length;
+                if (globalOffset <= end && seg.type !== 'space') {
+                    var div = contentEl().querySelector('[data-seg="' + i + '"]');
+                    if (div) setCaretSource(div, seg, globalOffset - acc);
+                    return;
+                }
+                acc = end;
+            }
+        }
+
+        function scheduleSave() {
+            if (_conflicts.length) return;
+            clearTimeout(_saveTimer);
+            _saveTimer = setTimeout(saveNow, 500);
+        }
+        // Fold the focused block's pending text edits into its source.
+        function flushActive() {
+            var active = document.activeElement;
+            var div = active ? (segDivFor(active) || (active.getAttribute && active.getAttribute('data-seg') !== null ? active : null)) : null;
+            if (div) flushSegment(div);
+        }
+
+        function saveNow() {
+            if (_conflicts.length) return;
+            flushActive();
+            var md = currentMarkdown();
+            _rawMarkdown = md; _baseMarkdown = md;
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.documentEdited) {
+                window.webkit.messageHandlers.documentEdited.postMessage(md);
+            }
+        }
+        function onBlur() { setTimeout(function(){ if (!_conflicts.length) saveNow(); }, 0); }
+
+        // WKWebView (macOS) does NOT emit beforeinput formatBold/formatItalic on
+        // Cmd+B/Cmd+I — the key equivalent reaches no handler and the system
+        // beeps. Intercept the keystroke directly and route to the same path.
+        function onKeydown(e) {
+            if (_currentMode !== 'reading' || _conflicts.length) return;
+            if (!e.metaKey || e.ctrlKey || e.altKey) return;
+            var k = (e.key || '').toLowerCase();
+            if (k !== 'b' && k !== 'i') return;
+            var sel = window.getSelection();
+            if (!sel.rangeCount) return;
+            var div = segDivFor(sel.anchorNode);
+            if (!div) return;
+            e.preventDefault();
+            doEmphasis(div, k === 'b' ? 'strong' : 'em');
+        }
+
+        function bindEditingListeners(content) {
+            if (_listenersBound) return;
+            content.addEventListener('beforeinput', onBeforeInput);
+            content.addEventListener('keydown', onKeydown);
+            content.addEventListener('paste', onPaste);
+            content.addEventListener('blur', onBlur, true);
+            _listenersBound = true;
+        }
+
+        // Called from Swift when the file changed on disk under the editor.
+        function applyDiskChange(diskMd) {
+            // Fold any in-progress (unsaved) edit into the source first, or the
+            // merge can't see it and would silently drop it / miss a conflict.
+            flushActive();
+            var res = EditorCore.reconcile(_baseMarkdown, currentMarkdown(), diskMd, marked);
+            if (res.conflicts.length === 0) {
+                _rawMarkdown = res.merged; _baseMarkdown = res.merged;
+                renderReading();
+                if (res.merged !== diskMd) scheduleSave(); // persist our merge
+                return;
+            }
+            _conflicts = res.conflicts;
+            _rawMarkdown = res.merged;
+            renderReading(); // re-render read-only with conflict overlays
+        }
+
+        function renderConflicts(content) {
+            content = content || contentEl();
+            // Idempotent: overlapping async re-renders must not stack panels.
+            content.querySelectorAll('.conflict-panel').forEach(function(p){ p.remove(); });
+            _conflicts.forEach(function(c) {
+                var anchor = (c.segIndex >= 0) ? content.querySelector('[data-seg="' + c.segIndex + '"]') : null;
+                var panel = document.createElement('div');
+                panel.className = 'conflict-panel';
+                panel.innerHTML =
+                    '<div class="conflict-title">⚠ This block changed on disk while you were editing — resolve to continue</div>' +
+                    '<div class="conflict-cols"><div class="conflict-col"><div class="conflict-label">Yours</div><pre class="conflict-mine"></pre></div>' +
+                    '<div class="conflict-col"><div class="conflict-label">On disk</div><pre class="conflict-disk"></pre></div></div>' +
+                    '<div class="conflict-actions"><button data-act="mine">Keep mine</button><button data-act="disk">Take disk</button></div>';
+                panel.querySelector('.conflict-mine').textContent = c.view;
+                panel.querySelector('.conflict-disk').textContent = c.disk;
+                panel.querySelector('[data-act="mine"]').addEventListener('click', function(){ resolveConflict(c, c.view); });
+                panel.querySelector('[data-act="disk"]').addEventListener('click', function(){ resolveConflict(c, c.disk); });
+                if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(panel, anchor.nextSibling);
+                else content.appendChild(panel);
+            });
+        }
+
+        function resolveConflict(c, chosen) {
+            if (c.segIndex >= 0 && _segments[c.segIndex]) {
+                _segments[c.segIndex].raw = chosen; relexSeg(_segments[c.segIndex]);
+            } else {
+                _rawMarkdown = chosen; _segments = EditorCore.segment(chosen, marked);
+            }
+            _conflicts = _conflicts.filter(function(x){ return x !== c; });
+            _rawMarkdown = currentMarkdown();
+            if (_conflicts.length === 0) {
+                _baseMarkdown = _rawMarkdown;
+                renderReading();
+                saveNow();
+            } else {
+                renderReading();
+            }
         }
     </script>
 </head>

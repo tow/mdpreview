@@ -4,7 +4,18 @@ PROJECT  = MarkdownPreview.xcodeproj
 DERIVED  = $(HOME)/Library/Developer/Xcode/DerivedData
 BUILT    = $(shell find $(DERIVED) -name "$(APP_NAME).app" -path "*/Debug/*" -print0 2>/dev/null | xargs -0 ls -dt 2>/dev/null | head -1)
 
-.PHONY: build install open clean
+.PHONY: build install open clean test js-test swift-test
+
+# Fast inner loop for the JS editing core (red/green TDD).
+js-test:
+	node --test tests/*.test.mjs
+
+# Swift unit tests (wraps xcodebuild per house rule — never call it directly).
+swift-test:
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug test
+
+# Full suite: JS core + Swift.
+test: js-test swift-test
 
 build:
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug build

@@ -17,6 +17,9 @@ struct MarkdownWebView: NSViewRepresentable {
     var pdfConfigJSON: String = "{}"
     var viewModeTrigger: Int = 0
     var baseURL: URL?
+    var diskChangeContent: String = ""
+    var diskChangeTrigger: Int = 0
+    var onEdit: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -27,6 +30,7 @@ struct MarkdownWebView: NSViewRepresentable {
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         config.userContentController.add(context.coordinator, name: "paginationDone")
         config.userContentController.add(context.coordinator, name: "consoleLog")
+        config.userContentController.add(context.coordinator, name: "documentEdited")
         let consoleScript = WKUserScript(
             source: "var _origLog = console.log; console.log = function() { var msg = Array.from(arguments).map(String).join(' '); _origLog.apply(console, arguments); window.webkit.messageHandlers.consoleLog.postMessage(msg); };",
             injectionTime: .atDocumentStart,
@@ -65,8 +69,18 @@ struct MarkdownWebView: NSViewRepresentable {
             coord.updateBaseURL(baseURL)
         }
 
+        // Deliver editor saves to the app (write file + echo suppression).
+        coord.onDocumentEdited = onEdit
+
         // Content change — also pass config so document mode always has it
         coord.render(markdownContent, viewMode: viewMode, configJSON: pdfConfigJSON)
+
+        // External disk change while editing: hand to JS for 3-way merge rather
+        // than clobbering the live DOM.
+        if diskChangeTrigger != coord.lastDiskChangeTrigger {
+            coord.lastDiskChangeTrigger = diskChangeTrigger
+            coord.applyDiskChange(diskChangeContent)
+        }
 
         // Theme change
         if theme.id != coord.lastThemeID {
@@ -121,10 +135,22 @@ struct MarkdownWebView: NSViewRepresentable {
         var lastViewModeTrigger: Int = -1
         var lastBaseURL: URL?
         var currentViewMode: ViewMode = .reading
+        var lastDiskChangeTrigger: Int = 0
+        var onDocumentEdited: ((String) -> Void)?
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             if message.name == "consoleLog" {
                 print("[JS] \(message.body)")
+                return
+            }
+            if message.name == "documentEdited" {
+                if let md = message.body as? String {
+                    // The DOM is now the source of truth for this content; mark it
+                    // rendered so the watcher echo of our own write can't re-render
+                    // and move the cursor.
+                    lastRenderedContent = md
+                    onDocumentEdited?(md)
+                }
                 return
             }
             if message.name == "paginationDone" {
@@ -148,6 +174,15 @@ struct MarkdownWebView: NSViewRepresentable {
             let clear = newQuery ? "window.getSelection().removeAllRanges();" : ""
             let js = "\(clear)window.find(\(jsonString), false, \(backwards), true)"
             webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+
+        func applyDiskChange(_ md: String) {
+            guard let webView,
+                  let data = try? JSONEncoder().encode(md),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            // markdownContent is unchanged on this path, so render() no-ops; if JS
+            // merges and saves, the documentEdited echo records the merged content.
+            webView.evaluateJavaScript("applyDiskChange(\(json))", completionHandler: nil)
         }
 
         func updateBaseURL(_ url: URL?) {

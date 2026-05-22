@@ -19,6 +19,12 @@ final class AppState: ObservableObject {
     @Published var viewMode: ViewMode = .reading
     @Published var viewModeTrigger: Int = 0
     @Published var pdfConfig: PDFConfig = PDFConfig.load()
+    @Published var diskChangeContent: String = ""
+    @Published var diskChangeTrigger: Int = 0
+
+    /// The exact text we last wrote to disk from the editor. Used to recognise
+    /// (and ignore) the file-watcher event our own write produces.
+    private var lastSavedFromEditor: String?
 
     func exportPDF() { exportPDFTrigger += 1 }
     func viewPDF() { viewPDFTrigger += 1 }
@@ -60,7 +66,7 @@ final class AppState: ObservableObject {
             rootNodes = FileNode.loadChildren(of: defaultRootURL)
         }
         watcher.onChange = { [weak self] in
-            self?.reloadCurrentFile()
+            self?.onExternalChange()
         }
         NotificationCenter.default.addObserver(forName: .showSearch, object: nil, queue: .main) { [weak self] _ in
             self?.showSearch = true
@@ -91,6 +97,8 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Full (re)load triggered by selecting a file. Pushes content through the
+    /// normal render path and establishes the in-sync baseline.
     private func reloadCurrentFile() {
         guard let url = selectedFile,
               let content = try? String(contentsOf: url, encoding: .utf8) else {
@@ -98,6 +106,32 @@ final class AppState: ObservableObject {
             return
         }
         markdownContent = content
+        lastSavedFromEditor = content
+    }
+
+    /// The file watcher fired. Ignore our own write echo; otherwise route a
+    /// genuine external change to the editor's 3-way merge (reading mode) or a
+    /// plain reload (document mode).
+    private func onExternalChange() {
+        guard let url = selectedFile,
+              let disk = try? String(contentsOf: url, encoding: .utf8) else { return }
+        if EditorSync.shouldIgnoreReload(disk: disk, lastSaved: lastSavedFromEditor) { return }
+        if viewMode == .reading {
+            lastSavedFromEditor = disk
+            diskChangeContent = disk
+            diskChangeTrigger += 1
+        } else {
+            lastSavedFromEditor = disk
+            markdownContent = disk
+        }
+    }
+
+    /// Persist an edit made in the rendered view. Writing is what produces the
+    /// watcher echo that `onExternalChange` then ignores via `lastSavedFromEditor`.
+    func saveEditedContent(_ md: String) {
+        guard let url = selectedFile else { return }
+        lastSavedFromEditor = md
+        try? md.write(to: url, atomically: true, encoding: .utf8)
     }
 }
 
@@ -129,7 +163,10 @@ struct ContentView: View {
                         viewMode: state.viewMode,
                         pdfConfigJSON: state.resolvedPDFConfigJSON,
                         viewModeTrigger: state.viewModeTrigger,
-                        baseURL: state.selectedFile?.deletingLastPathComponent()
+                        baseURL: state.selectedFile?.deletingLastPathComponent(),
+                        diskChangeContent: state.diskChangeContent,
+                        diskChangeTrigger: state.diskChangeTrigger,
+                        onEdit: { state.saveEditedContent($0) }
                     )
                     if state.showSearch {
                         SearchBar(

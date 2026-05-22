@@ -11,5 +11,8 @@ build/
 *.moved-aside
 *.xcuserstate
 
+# Node (JS editing-core test deps)
+node_modules/
+
 # macOS
 .DS_Store

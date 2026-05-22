@@ -29,3 +29,28 @@ targets:
         ENABLE_HARDENED_RUNTIME: NO
         PRODUCT_NAME: MarkdownPreview
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  MarkdownPreviewTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: MarkdownPreviewTests
+    dependencies:
+      - target: MarkdownPreview
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.arcticrex.MarkdownPreviewTests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        SWIFT_VERSION: "5.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+schemes:
+  MarkdownPreview:
+    build:
+      targets:
+        MarkdownPreview: all
+    test:
+      targets:
+        - MarkdownPreviewTests

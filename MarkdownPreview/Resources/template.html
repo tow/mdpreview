@@ -187,9 +187,15 @@
         var _baseMarkdown = '';      // last version common to disk + view (for 3-way merge)
         var _saveTimer = null;       // debounce for autosave
         var _conflicts = [];         // open blocking conflicts (suspends autosave)
-        var _undoStack = [];         // our own undo (native undo bypasses source mutations)
+        var _undoStack = [];         // our own undo (native undo bypasses source mutations); entries are { md, caret }
         var _redoStack = [];
+        var _lastUndoTime = 0;       // for coalescing a burst of typing into one undo step
+        var UNDO_COALESCE_MS = 800;
         var _listenersBound = false;
+        // A caret parked in an empty editable slot with no text node (a new
+        // empty <li>): { segIndex, srcOffset }. Typing is intercepted and folded
+        // into the source at srcOffset, since the DOM has nowhere to read it.
+        var _pendingEmpty = null;
 
         function mermaidTheme() {
             // Force default theme in document/PDF mode (matches force-light behavior);
@@ -268,7 +274,10 @@
             }
         }
 
-        async function renderReading() {
+        // keepSegments: render the in-memory _segments as-is (used when they
+        // carry a transient empty-paragraph block that isn't in _rawMarkdown).
+        // Otherwise re-segment from _rawMarkdown.
+        async function renderReading(keepSegments) {
             var content = document.getElementById('content');
             if (!content) {
                 // Rebuild content div if Paged.js destroyed it
@@ -280,7 +289,7 @@
             // Segmented render: one editable <div data-seg> per top-level block,
             // so edits can be folded back into just that block's source. `space`
             // separators stay in _segments (for reassembly) but aren't rendered.
-            _segments = EditorCore.segment(_rawMarkdown, marked);
+            if (!keepSegments) _segments = EditorCore.segment(_rawMarkdown, marked);
             content.className = isGithubTheme() ? 'markdown-body' : '';
             content.innerHTML = '';
             var editing = (_currentMode === 'reading' && _conflicts.length === 0);
@@ -289,8 +298,16 @@
                 var div = document.createElement('div');
                 div.className = 'seg';
                 div.setAttribute('data-seg', String(i));
+                if (seg.transient) {
+                    // Empty editable paragraph: a caret target with no source bytes.
+                    div.setAttribute('contenteditable', 'true');
+                    div.innerHTML = '<p><br></p>';
+                    content.appendChild(div);
+                    return;
+                }
                 div.setAttribute('contenteditable', (editing && seg.editable) ? 'true' : 'false');
                 div.innerHTML = marked.parse(preprocessImages(seg.raw));
+                EditorCore.stripStructuralWhitespace(div);
                 content.appendChild(div);
             });
             resolveRelativePaths(content);
@@ -504,8 +521,12 @@
         // ===================== In-place editing =====================
 
         function contentEl() { return document.getElementById('content'); }
-        function currentMarkdown() { return _segments.map(function(s){ return s.raw; }).join(''); }
-        function priorLen(i) { var n = 0; for (var k = 0; k < i; k++) n += _segments[k].raw.length; return n; }
+        // Transient segments are caret-only placeholders (raw ''); they never
+        // reach disk and contribute no bytes to the document.
+        function segRaw(s) { return s.transient ? '' : s.raw; }
+        function currentMarkdown() { return _segments.map(segRaw).join(''); }
+        function priorLen(i) { var n = 0; for (var k = 0; k < i; k++) n += segRaw(_segments[k]).length; return n; }
+        function makeTransient() { return { type: 'paragraph', raw: '', token: null, editable: true, transient: true }; }
 
         function segDivFor(node) {
             var content = contentEl();
@@ -524,6 +545,7 @@
 
         function renderSeg(div, seg) {
             div.innerHTML = marked.parse(preprocessImages(seg.raw));
+            EditorCore.stripStructuralWhitespace(div);
             resolveRelativePaths(div);
             div.querySelectorAll('pre code:not(.language-mermaid)').forEach(function(b){ hljs.highlightElement(b); });
         }
@@ -533,7 +555,7 @@
         // not a clean leaf substitution and the caller restores the block).
         function flushSegment(div) {
             var i = segIndexOf(div), seg = _segments[i];
-            if (!seg) return true;
+            if (!seg || seg.transient || !seg.token) return true; // no source to fold into
             var res = EditorCore.readEditsFromDom(div, seg.token);
             if (!res.clean) return false;
             if (res.edits.size > 0) { seg.raw = EditorCore.applyLeafEdits(seg, res.edits); relexSeg(seg); }
@@ -546,6 +568,10 @@
             var sel = window.getSelection(), r = document.createRange();
             r.setStart(pos.node, pos.offset); r.collapse(true);
             sel.removeAllRanges(); sel.addRange(r);
+            // Caret parked in an empty element (a new empty <li>): record the
+            // source offset so typing can be folded in (the DOM can't hold it).
+            if (pos.node.nodeType === 1) _pendingEmpty = { segIndex: segIndexOf(div), srcOffset: srcOffset };
+            else _pendingEmpty = null;
         }
         function setSelectionSource(div, seg, a, b) {
             var pa = EditorCore.sourceOffsetToDom(div, a, seg.token);
@@ -556,22 +582,61 @@
             sel.removeAllRanges(); sel.addRange(r);
         }
 
+        // Current caret as a document-global source offset (null if not in a block).
+        function currentGlobalCaret() {
+            var sel = window.getSelection();
+            if (!sel || !sel.rangeCount) return null;
+            var div = segDivFor(sel.anchorNode);
+            if (!div) return null;
+            var i = segIndexOf(div), seg = _segments[i];
+            if (!seg) return null;
+            var local = EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token);
+            return priorLen(i) + local;
+        }
+        // Fold any pending edit into the source, then snapshot doc + caret.
+        function snapshot() {
+            flushActive();
+            return { md: currentMarkdown(), caret: currentGlobalCaret() };
+        }
+        // A distinct undo step (structural ops, paste) — never coalesced.
         function pushUndo() {
-            _undoStack.push(currentMarkdown());
+            _undoStack.push(snapshot());
             if (_undoStack.length > 200) _undoStack.shift();
             _redoStack = [];
+            _lastUndoTime = 0; // force the next keystroke to start a fresh checkpoint
+        }
+        // An undo step for a burst of typing — coalesced so a run of keystrokes
+        // collapses into one step (the pre-burst state captured on the first key).
+        function pushTypingUndo() {
+            var now = Date.now();
+            if (_undoStack.length && now - _lastUndoTime < UNDO_COALESCE_MS) {
+                _lastUndoTime = now; // mid-burst — keep the earlier checkpoint
+                return;
+            }
+            _undoStack.push(snapshot());
+            if (_undoStack.length > 200) _undoStack.shift();
+            _redoStack = [];
+            _lastUndoTime = now;
         }
         function undo() {
             if (!_undoStack.length) return;
-            _redoStack.push(currentMarkdown());
-            _rawMarkdown = _undoStack.pop();
-            renderReading(); scheduleSave();
+            _redoStack.push(snapshot());
+            var prev = _undoStack.pop();
+            _rawMarkdown = prev.md;
+            renderReading();
+            if (prev.caret != null) restoreGlobalCaret(prev.caret);
+            _lastUndoTime = 0;
+            scheduleSave();
         }
         function redo() {
             if (!_redoStack.length) return;
-            _undoStack.push(currentMarkdown());
-            _rawMarkdown = _redoStack.pop();
-            renderReading(); scheduleSave();
+            _undoStack.push(snapshot());
+            var next = _redoStack.pop();
+            _rawMarkdown = next.md;
+            renderReading();
+            if (next.caret != null) restoreGlobalCaret(next.caret);
+            _lastUndoTime = 0;
+            scheduleSave();
         }
 
         function atBlockStart(sel, div) {
@@ -587,18 +652,33 @@
             if (!sel.rangeCount) return;
             var div = segDivFor(sel.anchorNode);
             if (!div) { e.preventDefault(); return; }
+            var i = segIndexOf(div), seg = _segments[i];
             var t = e.inputType;
-            if (t === 'insertText' || t === 'insertReplacementText' || t === 'insertCompositionText') { scheduleSave(); return; }
+            if (t === 'insertText') {
+                // Typing into an empty slot (transient paragraph, or a new empty
+                // <li>) can't be read back from the DOM — fold it into source.
+                if (seg && seg.transient && e.data) { e.preventDefault(); materializeTransient(i, e.data, e.data.length); return; }
+                if (e.data && _pendingEmpty && _pendingEmpty.segIndex === i) {
+                    var li = caretAtItemStart(div);
+                    if (li && li.textContent === '') { e.preventDefault(); typeIntoEmptyItem(i, e.data); return; }
+                }
+                pushTypingUndo(); scheduleSave(); return;
+            }
+            if (t === 'insertReplacementText' || t === 'insertCompositionText') { pushTypingUndo(); scheduleSave(); return; }
             if (t.indexOf('delete') === 0) {
-                if (t === 'deleteContentBackward' && atBlockStart(sel, div) && segIndexOf(div) > 0) { e.preventDefault(); doMerge(div); return; }
-                scheduleSave(); return;
+                if (t === 'deleteContentBackward') {
+                    if (seg && seg.transient) { e.preventDefault(); removeTransient(i); return; }
+                    if (seg && seg.type === 'list' && caretAtItemStart(div)) { e.preventDefault(); doMergeListItem(div); return; }
+                    if (atBlockStart(sel, div) && i > 0) { e.preventDefault(); doMerge(div); return; }
+                }
+                pushTypingUndo(); scheduleSave(); return;
             }
             if (t === 'formatBold') { e.preventDefault(); doEmphasis(div, 'strong'); return; }
             if (t === 'formatItalic') { e.preventDefault(); doEmphasis(div, 'em'); return; }
             if (t === 'insertParagraph' || t === 'insertLineBreak') { e.preventDefault(); doSplit(div); return; }
             if (t === 'historyUndo') { e.preventDefault(); undo(); return; }
             if (t === 'historyRedo') { e.preventDefault(); redo(); return; }
-            e.preventDefault(); // out of vocabulary (lists, hr, colour, drop, paste handled below)
+            e.preventDefault(); // out of vocabulary (hr, colour, drop, paste handled below)
         }
 
         function onPaste(e) {
@@ -606,6 +686,7 @@
             var sel = window.getSelection();
             if (!sel.rangeCount || !segDivFor(sel.anchorNode)) return;
             e.preventDefault();
+            pushUndo();
             var text = (e.clipboardData || window.clipboardData).getData('text/plain') || '';
             document.execCommand('insertText', false, text.replace(/\r?\n+/g, ' '));
             scheduleSave();
@@ -633,15 +714,113 @@
         function doSplit(div) {
             if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
             var i = segIndexOf(div), seg = _segments[i];
+            if (seg.transient) { return; } // Enter on a blank line: nothing to split
             var sel = window.getSelection();
             var local = EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token);
             var res = EditorCore.splitBlock(seg.raw, local, marked);
+            if (res.exit) { doListExit(i, res.before, res.after); return; } // Return on empty item
             pushUndo();
-            var globalCaret = priorLen(i) + res.caret;
+            // End-of-block Return on a paragraph/heading → a transient empty
+            // paragraph (the editor has no source bytes for an empty block).
+            if (seg.type !== 'list' && res.md.slice(res.caret).replace(/\s+$/, '') === '') {
+                _segments.splice(i + 1, 0, makeTransient());
+                renderReading(true);
+                placeCaretInTransient(i + 1);
+                scheduleSave();
+                return;
+            }
             seg.raw = res.md;
             _rawMarkdown = currentMarkdown();
             renderReading();
-            restoreGlobalCaret(globalCaret);
+            restoreGlobalCaret(priorLen(i) + res.caret);
+            scheduleSave();
+        }
+
+        // Return on an empty list item: drop the item, leave a transient empty
+        // paragraph between the list halves (the caret lands there).
+        function doListExit(i, before, after) {
+            pushUndo();
+            // Trim boundary whitespace so the rebuilt list segs don't carry a
+            // stray trailing newline (which would segment into an extra blank).
+            before = before.replace(/\s+$/, '');
+            after = after.replace(/^\s+/, '');
+            var beforeSegs = before ? EditorCore.segment(before, marked) : [];
+            var afterSegs = after ? EditorCore.segment(after, marked) : [];
+            var tp = makeTransient();
+            var repl = beforeSegs.concat([tp], afterSegs);
+            // A trailing empty item can orphan its " \n" into a following space
+            // seg; drop it too — but ONLY when it's truly trailing (nothing real
+            // after it). When a paragraph follows, that space seg is the
+            // blank-line separator and must be kept, or the list swallows it.
+            var nextSpace = _segments[i + 1] && _segments[i + 1].type === 'space';
+            var trailing = nextSpace && !_segments[i + 2];
+            var removeCount = (!after && trailing) ? 2 : 1;
+            _segments.splice.apply(_segments, [i, removeCount].concat(repl));
+            _rawMarkdown = currentMarkdown();
+            renderReading(true);
+            placeCaretInTransient(i + beforeSegs.length);
+            scheduleSave();
+        }
+
+        // Backspace at a list item's content start: merge into the previous item,
+        // or outdent the first item to a paragraph.
+        function doMergeListItem(div) {
+            if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
+            var i = segIndexOf(div), seg = _segments[i];
+            var sel = window.getSelection();
+            var local = EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token);
+            var res = EditorCore.mergeListItem(seg.raw, local, marked);
+            pushUndo();
+            seg.raw = res.md;
+            _rawMarkdown = currentMarkdown();
+            renderReading();
+            restoreGlobalCaret(priorLen(i) + res.caret);
+            scheduleSave();
+        }
+
+        // Tab / Shift+Tab on a list item: nest / unnest.
+        function doIndent(div, outdent) {
+            if (!flushSegment(div)) { renderSeg(div, _segments[segIndexOf(div)]); return; }
+            var i = segIndexOf(div), seg = _segments[i];
+            var sel = window.getSelection();
+            var local = EditorCore.domOffsetToSourceOffset(div, sel.anchorNode, sel.anchorOffset, seg.token);
+            var res = outdent ? EditorCore.outdentItem(seg.raw, local, marked) : EditorCore.indentItem(seg.raw, local, marked);
+            if (res.md === seg.raw) return; // no-op (e.g. Tab on the first item)
+            pushUndo();
+            seg.raw = res.md;
+            _rawMarkdown = currentMarkdown();
+            renderReading();
+            restoreGlobalCaret(priorLen(i) + res.caret);
+            scheduleSave();
+        }
+
+        // Fold a keystroke into a new empty <li> (which has no text node to read).
+        // The empty item's source line is a bare/short marker ("-", "- ", "1.");
+        // rebuild it as "<marker> <data>" so it stays a valid list item.
+        function typeIntoEmptyItem(i, data) {
+            var seg = _segments[i], off = _pendingEmpty.srcOffset, raw = seg.raw;
+            var ls = raw.lastIndexOf('\n', off - 1) + 1;
+            var le = raw.indexOf('\n', off); if (le < 0) le = raw.length;
+            var line = raw.slice(ls, le);
+            var m = line.match(/^(\s*(?:[-*+]|\d+[.)]))/);
+            var newLine = (m ? m[1] : '-') + ' ' + data;
+            pushUndo();
+            seg.raw = raw.slice(0, ls) + newLine + raw.slice(le);
+            relexSeg(seg);
+            _rawMarkdown = currentMarkdown();
+            _pendingEmpty = null;
+            renderReading();
+            restoreGlobalCaret(priorLen(i) + ls + newLine.length);
+            scheduleSave();
+        }
+
+        // Backspace on a blank (transient) line: remove it, caret to prior block.
+        function removeTransient(i) {
+            pushUndo();
+            _segments.splice(i, 1);
+            _rawMarkdown = currentMarkdown();
+            renderReading();
+            restoreGlobalCaret(priorLen(i));
             scheduleSave();
         }
 
@@ -657,17 +836,68 @@
         }
 
         // Place the caret at a document-global source offset after a full re-render.
+        // Transient segs contribute no bytes and aren't caret targets here (they
+        // are positioned explicitly via placeCaretInTransient).
         function restoreGlobalCaret(globalOffset) {
-            var acc = 0;
+            var acc = 0, lastEd = null;
             for (var i = 0; i < _segments.length; i++) {
-                var seg = _segments[i], end = acc + seg.raw.length;
-                if (globalOffset <= end && seg.type !== 'space') {
+                var seg = _segments[i], len = segRaw(seg).length, end = acc + len;
+                var editable = seg.type !== 'space' && !seg.transient;
+                if (editable && globalOffset >= acc && globalOffset <= end) {
                     var div = contentEl().querySelector('[data-seg="' + i + '"]');
                     if (div) setCaretSource(div, seg, globalOffset - acc);
                     return;
                 }
+                if (editable) lastEd = { seg: seg, i: i, start: acc, len: len };
                 acc = end;
             }
+            // Offset fell in a separator/gap (e.g. a trailing empty list item's
+            // orphaned whitespace) — clamp to the end of the last editable block.
+            if (lastEd) {
+                var d = contentEl().querySelector('[data-seg="' + lastEd.i + '"]');
+                if (d) setCaretSource(d, lastEd.seg, Math.min(globalOffset - lastEd.start, lastEd.len));
+            }
+        }
+
+        // Caret target helpers for transient empty paragraphs.
+        function placeCaretInTransient(idx) {
+            var div = contentEl().querySelector('[data-seg="' + idx + '"]');
+            if (!div) return;
+            var p = div.querySelector('p') || div;
+            var sel = window.getSelection(), r = document.createRange();
+            r.setStart(p, 0); r.collapse(true);
+            sel.removeAllRanges(); sel.addRange(r);
+            _pendingEmpty = null;
+        }
+
+        // Rebuild the document with the transient seg at index i replaced by
+        // blockMd, separated by blank lines, and put the caret at caretInBlock
+        // within it. Used to "realize" a transient (first keystroke, or Tab→list).
+        function materializeTransient(i, blockMd, caretInBlock) {
+            var before = _segments.slice(0, i).map(segRaw).join('').replace(/\s+$/, '');
+            var after = _segments.slice(i + 1).map(segRaw).join('').replace(/^\s+/, '');
+            var parts = [];
+            if (before) parts.push(before);
+            var caretBase = parts.join('\n\n').length + (parts.length ? 2 : 0);
+            parts.push(blockMd);
+            if (after) parts.push(after);
+            _rawMarkdown = parts.join('\n\n') + '\n';
+            renderReading();
+            restoreGlobalCaret(caretBase + caretInBlock);
+            scheduleSave();
+        }
+
+        // Caret is at the start of a list item's content → return its <li> (for
+        // Backspace-merge), else null.
+        function caretAtItemStart(div) {
+            var sel = window.getSelection();
+            if (!sel.isCollapsed) return null;
+            var n = sel.anchorNode, li = null;
+            while (n && n !== div) { if (n.nodeType === 1 && n.tagName === 'LI') { li = n; break; } n = n.parentNode; }
+            if (!li) return null;
+            var r = document.createRange();
+            r.selectNodeContents(li); r.setEnd(sel.anchorNode, sel.anchorOffset);
+            return r.toString().length === 0 ? li : null;
         }
 
         function scheduleSave() {
@@ -696,10 +926,57 @@
         // WKWebView (macOS) does NOT emit beforeinput formatBold/formatItalic on
         // Cmd+B/Cmd+I — the key equivalent reaches no handler and the system
         // beeps. Intercept the keystroke directly and route to the same path.
+        // Up/Down at a block's top/bottom edge: hop to the adjacent editable
+        // block (each block is its own contenteditable, so native caret nav
+        // stops at the edge). Returns true if it moved the caret.
+        function crossBlockArrow(dir) {
+            var sel = window.getSelection();
+            if (!sel.rangeCount || !sel.isCollapsed) return false;
+            var div = segDivFor(sel.anchorNode);
+            if (!div) return false;
+            var range = sel.getRangeAt(0);
+            var rects = range.getClientRects();
+            var cr = (rects && rects.length) ? rects[0] : range.getBoundingClientRect();
+            if (!cr || (!cr.height && !cr.top)) return false;
+            if (!EditorCore.atBlockEdge(cr, div.getBoundingClientRect(), dir)) return false;
+            var target = EditorCore.adjacentEditableSeg(div, dir);
+            if (!target) return false;
+            var tr = target.getBoundingClientRect();
+            var pad = Math.max(4, (cr.height || 16) * 0.5);
+            var y = dir < 0 ? tr.bottom - pad : tr.top + pad;
+            target.focus({ preventScroll: true });
+            var dest = document.caretRangeFromPoint ? document.caretRangeFromPoint(cr.left, y) : null;
+            var r = document.createRange();
+            if (dest && segDivFor(dest.startContainer) === target) { r = dest; }
+            else { r.selectNodeContents(target); r.collapse(dir > 0); } // Down→start, Up→end
+            sel.removeAllRanges(); sel.addRange(r);
+            return true;
+        }
+
         function onKeydown(e) {
             if (_currentMode !== 'reading' || _conflicts.length) return;
+            if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey && !e.metaKey && !e.altKey) {
+                if (crossBlockArrow(e.key === 'ArrowUp' ? -1 : 1)) e.preventDefault();
+                return;
+            }
+            // Tab / Shift+Tab — not delivered as beforeinput by WKWebView. On a
+            // list item: nest / unnest. On a blank (transient) line: start a list.
+            if (e.key === 'Tab') {
+                var tsel = window.getSelection();
+                if (!tsel.rangeCount) return;
+                var tdiv = segDivFor(tsel.anchorNode);
+                if (!tdiv) return;
+                var ti = segIndexOf(tdiv), tseg = _segments[ti];
+                if (tseg && tseg.transient) { e.preventDefault(); if (!e.shiftKey) materializeTransient(ti, '-', 1); return; }
+                if (tseg && tseg.type === 'list') { e.preventDefault(); doIndent(tdiv, e.shiftKey); return; }
+                return;
+            }
             if (!e.metaKey || e.ctrlKey || e.altKey) return;
             var k = (e.key || '').toLowerCase();
+            // Cmd+Z / Cmd+Shift+Z — WKWebView never delivers these as historyUndo
+            // beforeinput events, so intercept the keystroke directly (as for B/I).
+            if (k === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+            if (e.shiftKey) return;
             if (k !== 'b' && k !== 'i') return;
             var sel = window.getSelection();
             if (!sel.rangeCount) return;

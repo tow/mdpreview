@@ -87,18 +87,38 @@
       return token.raw;
     }
     if (!anyEdited(token, edits)) return token.raw;
-    var innerOld = kids.map(function (c) { return c.raw; }).join('');
-    var idx = token.raw.indexOf(innerOld);
-    if (idx < 0) return token.raw; // can't locate the inner span — don't risk corruption
-    var open = token.raw.slice(0, idx);
-    var close = token.raw.slice(idx + innerOld.length);
-    var inner = kids.map(function (c) { return reserialize(c, edits); }).join('');
-    return open + inner + close;
+    // Locate each child's raw by forward search and keep the gaps between them
+    // (list markers, nested indentation, open/close affixes) verbatim. A single
+    // indexOf of the joined children fails for nested lists — marked strips a
+    // nested block's leading indentation from its raw, so the concatenation
+    // isn't a contiguous substring — which would silently drop the edit.
+    var raw = token.raw, out = '', search = 0;
+    for (var i = 0; i < kids.length; i++) {
+      var idx = raw.indexOf(kids[i].raw, search);
+      if (idx < 0) return token.raw; // can't locate — don't risk corruption
+      out += raw.slice(search, idx) + reserialize(kids[i], edits);
+      search = idx + kids[i].raw.length;
+    }
+    return out + raw.slice(search);
   }
 
-  /** Rebuild a segment's raw from leaf edits. */
+  /**
+   * Apply pure text-leaf edits to a segment's raw. Splices each edited leaf's
+   * new text at its source span (from leafMap) — robust to nested lists, where
+   * the tree-walking reserialize can't reconstruct deindented child raws.
+   */
   function applyLeafEdits(segment, edits) {
-    return reserialize(segment.token, edits);
+    if (!edits || edits.size === 0) return segment.raw;
+    var leaves = leafMap(segment.token), ops = [];
+    for (var i = 0; i < leaves.length; i++) {
+      if (leaves[i].type === 'text' && edits.has(leaves[i].token)) {
+        ops.push({ start: leaves[i].rawStart, end: leaves[i].rawEnd, text: edits.get(leaves[i].token) });
+      }
+    }
+    ops.sort(function (a, b) { return b.start - a.start; }); // right-to-left so offsets stay valid
+    var raw = segment.raw;
+    for (var j = 0; j < ops.length; j++) raw = raw.slice(0, ops[j].start) + ops[j].text + raw.slice(ops[j].end);
+    return raw;
   }
 
   // --- Bold / italic toggle ------------------------------------------------
@@ -189,29 +209,155 @@
     return { left: left, right: right };
   }
 
-  function splitList(listMd, offset, list) {
-    var items = list.items, pos = 0;
+  // --- List item structure -------------------------------------------------
+  //
+  // marked drops trailing whitespace from a trailing *empty* item's raw (the
+  // last item of "- one\n- \n" has raw "-"), so item.raw lengths don't tile the
+  // source exactly. We locate each item by forward search, detect empty items
+  // from the source line, and handle indent/outdent line-based — all robust to
+  // that quirk and to nesting.
+
+  var LIST_MARKER = /^(\s*(?:[-*+]|\d+[.)])[ \t]?)/;       // marker incl one optional space
+  var EMPTY_ITEM_LINE = /^\s*(?:[-*+]|\d+[.)])[ \t]*$/;     // a marker with no content
+  var MARKER_LINE = /^\s*(?:[-*+]|\d+[.)])/;
+
+  function itemMarker(raw) { var m = raw.match(LIST_MARKER); return m ? m[1] : ''; }
+  function itemContent(raw) { return raw.slice(itemMarker(raw).length).replace(/\n+$/, ''); }
+
+  // Absolute [start,end) of each top-level item within listMd.
+  function itemSpans(listMd, items) {
+    var spans = [], search = 0;
     for (var i = 0; i < items.length; i++) {
       var raw = items[i].raw;
-      if (offset > pos && offset < pos + raw.length) {
-        var item = items[i];
-        var innerOld = item.tokens.map(function (c) { return c.raw; }).join('');
-        var idx = raw.indexOf(innerOld);
-        var marker = raw.slice(0, idx);
-        var trailing = raw.slice(idx + innerOld.length);
-        var rel = Math.max(0, Math.min(offset - pos - idx, innerOld.length));
-        var sp = splitTokenList(item.tokens, rel);
-        // Single \n keeps the list tight; reuse the marker (markdown renumbers
-        // ordered lists on render, so no explicit renumber is needed).
-        var newItemRaw = marker + sp.left + '\n' + marker + sp.right + trailing;
-        return {
-          md: listMd.slice(0, pos) + newItemRaw + listMd.slice(pos + raw.length),
-          caret: pos + (marker + sp.left + '\n' + marker).length,
-        };
-      }
-      pos += raw.length;
+      var start = listMd.indexOf(raw, search);
+      if (start < 0) start = search;
+      spans.push({ item: items[i], start: start, end: start + raw.length });
+      search = start + raw.length;
     }
-    return { md: listMd, caret: offset };
+    return spans;
+  }
+
+  // Index of the (top-level) item the caret sits in: the last item that starts
+  // at or before the offset.
+  function itemAt(spans, offset) {
+    var idx = 0;
+    for (var i = 0; i < spans.length; i++) { if (spans[i].start <= offset) idx = i; }
+    return idx;
+  }
+
+  function lineRange(md, offset) {
+    var start = md.lastIndexOf('\n', offset - 1) + 1;
+    var end = md.indexOf('\n', offset);
+    return { start: start, end: end < 0 ? md.length : end };
+  }
+
+  // Turn the item at index i into a paragraph; items before/after stay lists.
+  function outdentToParagraph(listMd, spans, i) {
+    var before = '', after = '';
+    for (var k = 0; k < spans.length; k++) {
+      if (k < i) before += spans[k].item.raw;
+      else if (k > i) after += spans[k].item.raw;
+    }
+    before = before.replace(/\s+$/, '');
+    after = after.replace(/\s+$/, '');
+    var content = itemContent(spans[i].item.raw);
+    var parts = [];
+    if (before) parts.push(before);
+    parts.push(content);
+    if (after) parts.push(after);
+    return { md: parts.join('\n\n') + '\n', caret: (before ? before.length + 2 : 0) };
+  }
+
+  // Split a list at the caret. Line-based on the caret's item line, so it works
+  // at any nesting depth (the line's own indent+marker is reused for the new
+  // item) and is robust to marked's empty-item raw quirks.
+  function splitList(listMd, offset) {
+    var lr = lineRange(listMd, offset);
+    var line = listMd.slice(lr.start, lr.end);
+    // Empty item under the caret → exit the list.
+    if (EMPTY_ITEM_LINE.test(line)) {
+      return { exit: true, before: listMd.slice(0, lr.start), after: listMd.slice(lr.end + 1) };
+    }
+    var m = line.match(/^(\s*(?:[-*+]|\d+[.)])\s+)/);
+    if (!m) { // continuation/lazy line with no marker — just break the line
+      return { md: listMd.slice(0, offset) + '\n' + listMd.slice(offset), caret: offset + 1 };
+    }
+    var marker = m[1];
+    var rightOnLine = listMd.slice(offset, lr.end);
+    // A new empty item with nothing meaningful after it (it will be the last
+    // item at its level): emit a bare bullet — no trailing space/newline. A
+    // "- \n" trailing item re-lexes into list + a stray `space` token; the bare
+    // form stays one clean list and round-trips. An *indented* bare "-" would
+    // be read as a setext underline, so use "*" there (never a setext char).
+    if (rightOnLine === '' && /^\s*$/.test(listMd.slice(offset))) {
+      var bullet = marker.replace(/\s+$/, '');
+      if (/^\s+-$/.test(bullet)) bullet = bullet.replace('-', '*');
+      return { md: listMd.slice(0, offset) + '\n' + bullet, caret: offset + 1 + bullet.length };
+    }
+    var newMarker = marker;
+    if (rightOnLine === '' && /^\s+-\s+$/.test(newMarker)) newMarker = newMarker.replace('-', '*');
+    return {
+      md: listMd.slice(0, offset) + '\n' + newMarker + listMd.slice(offset),
+      caret: offset + 1 + newMarker.length,
+    };
+  }
+
+  /**
+   * Backspace at the start of a list item's content. A non-first item merges
+   * its content onto the end of the previous item; the first item (no previous
+   * sibling to merge into) outdents to a plain paragraph.
+   */
+  // Backspace at the start of a list item's content. Line-based, so it works at
+  // any nesting depth: an item with an item line above it merges its content up
+  // into that line (dropping this line's marker); the very first line of the
+  // block outdents to a plain paragraph. Mirrors how a contenteditable joins a
+  // line to the one above, but marker-aware.
+  function mergeListItem(listMd, offset, marked) {
+    var lr = lineRange(listMd, offset);
+    var line = listMd.slice(lr.start, lr.end);
+    var m = line.match(/^(\s*(?:[-*+]|\d+[.)])\s*)/); // indent + marker (+ optional space)
+    if (!m) return { md: listMd, caret: offset };
+    var contentStart = lr.start + m[1].length;
+    if (offset > contentStart) return { md: listMd, caret: offset }; // not at item start
+    if (lr.start === 0) {
+      // First line of the block → outdent to a paragraph; the rest stays a list.
+      var content = line.slice(m[1].length);
+      var rest = listMd.slice(lr.end).replace(/^\n+/, '');
+      return { md: rest ? content + '\n\n' + rest : content + '\n', caret: 0 };
+    }
+    // Merge up: delete the newline before this line and this line's marker.
+    return { md: listMd.slice(0, lr.start - 1) + listMd.slice(contentStart), caret: lr.start - 1 };
+  }
+
+  /** Tab: nest the caret's item line under the item above it. */
+  function indentItem(listMd, offset, marked) {
+    var lr = lineRange(listMd, offset);
+    var line = listMd.slice(lr.start, lr.end);
+    if (lr.start === 0 || !MARKER_LINE.test(line)) return { md: listMd, caret: offset }; // can't nest the first line
+    var indented = '  ' + line;
+    // An empty "-" bullet, once indented under a text line, is parsed as a
+    // setext-H2 underline (turning the parent line into a heading). Switch an
+    // empty dash bullet to "*", which can never be a setext underline.
+    if (/^\s*-\s*$/.test(indented)) indented = indented.replace('-', '*');
+    return { md: listMd.slice(0, lr.start) + indented + listMd.slice(lr.end), caret: offset + 2 };
+  }
+
+  /** Shift+Tab: unindent the caret's item line; a top-level item becomes a paragraph. */
+  function outdentItem(listMd, offset, marked) {
+    var lr = lineRange(listMd, offset);
+    var line = listMd.slice(lr.start, lr.end);
+    var m = line.match(/^( {1,2}|\t)/);
+    if (m) {
+      var out = line.slice(m[1].length);
+      return {
+        md: listMd.slice(0, lr.start) + out + listMd.slice(lr.end),
+        caret: Math.max(lr.start, offset - m[1].length),
+      };
+    }
+    var list = marked.lexer(listMd)[0];
+    if (!list || list.type !== 'list') return { md: listMd, caret: offset };
+    var spans = itemSpans(listMd, list.items);
+    return outdentToParagraph(listMd, spans, itemAt(spans, offset));
   }
 
   /**
@@ -294,23 +440,28 @@
 
   function dispTextOf(token) { return token.text !== undefined ? token.text : token.raw; }
 
-  // Ordered leaves of a block with source (raw) and display spans.
+  // Ordered leaves of a block with source (raw) and display spans. Positions are
+  // found by forward-searching each leaf's raw in the block source directly —
+  // NOT by composing offsets down the token tree. Composition breaks for nested
+  // lists because marked strips a nested block's leading indentation from its
+  // raw, so child raws don't tile the parent. A leaf's own raw (text, codespan,
+  // escape) always appears verbatim in the source, so a left-to-right scan locates
+  // it correctly at any nesting depth.
   function leafMap(blockToken) {
     var leaves = [];
-    (function walk(token, rawBase) {
+    (function walk(token) {
       var kids = childrenOf(token);
-      if (!kids) {
-        leaves.push({ token: token, type: token.type, rawStart: rawBase, rawEnd: rawBase + token.raw.length });
-        return;
-      }
-      var innerOld = kids.map(function (c) { return c.raw; }).join('');
-      var idx = token.raw.indexOf(innerOld);
-      if (idx < 0) idx = 0;
-      var pos = rawBase + idx;
-      for (var i = 0; i < kids.length; i++) { walk(kids[i], pos); pos += kids[i].raw.length; }
-    })(blockToken, 0);
-    var disp = 0;
+      if (!kids) { leaves.push({ token: token, type: token.type }); return; }
+      for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    })(blockToken);
+    var src = blockToken.raw, search = 0, disp = 0;
     for (var j = 0; j < leaves.length; j++) {
+      var raw = leaves[j].token.raw;
+      var idx = src.indexOf(raw, search);
+      if (idx < 0) idx = search; // best effort — should not happen for leaf raws
+      leaves[j].rawStart = idx;
+      leaves[j].rawEnd = idx + raw.length;
+      search = idx + raw.length;
       var len = dispTextOf(leaves[j].token).length;
       leaves[j].dispStart = disp;
       leaves[j].dispEnd = disp + len;
@@ -340,43 +491,184 @@
     return { node: last, offset: last ? last.textContent.length : 0 };
   }
 
-  // bias resolves leaf-boundary ambiguity: a selection START biases into the
-  // following leaf (e.g. just past an opening **), an END biases into the
-  // preceding leaf (just before a closing **) so emphasis stays selectable.
+  // Remove whitespace-only text nodes (outside <pre>/<code>) from a rendered
+  // block. marked pretty-prints HTML with "\n" between block tags (e.g. between
+  // <li> elements); those nodes inflate the DOM's textContent relative to the
+  // token-based leaf display model, so caret mapping drifts in multi-element
+  // blocks like lists. Stripping them makes textContent === concat(leaf text).
+  function stripStructuralWhitespace(el) {
+    var doc = el.ownerDocument;
+    var w = doc.createTreeWalker(el, SHOW_TEXT);
+    var kill = [], n;
+    while ((n = w.nextNode())) {
+      if (!/^\s*$/.test(n.textContent)) continue;
+      var p = n.parentNode, inPre = false;
+      while (p && p !== el) {
+        var tag = (p.tagName || '').toUpperCase();
+        if (tag === 'PRE' || tag === 'CODE') { inPre = true; break; }
+        p = p.parentNode;
+      }
+      if (!inPre) kill.push(n);
+    }
+    kill.forEach(function (x) { x.parentNode.removeChild(x); });
+    return el;
+  }
+
+  // Ordered non-empty text nodes of el. After stripStructuralWhitespace these
+  // carry exactly the leaf display text, in document order. A single node may
+  // span several leaves (e.g. text + escape + text within one <p>), so the
+  // correspondence is by display *range*, not 1:1.
+  function textNodesOf(el) {
+    var w = el.ownerDocument.createTreeWalker(el, SHOW_TEXT);
+    var nodes = [], n;
+    while ((n = w.nextNode())) { if (n.textContent.length) nodes.push(n); }
+    return nodes;
+  }
+
+  // Display start offset of `node` (sum of prior text nodes' lengths), or -1 if
+  // it isn't one of el's text nodes.
+  function nodeDispStart(nodes, node) {
+    var acc = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i] === node) return acc;
+      acc += nodes[i].textContent.length;
+    }
+    return -1;
+  }
+
+  // The (node, offset) at a linear display offset, biased to the node that
+  // *starts* at the offset (preferStart) or *ends* at it. This is what tells
+  // start-of-item-2 (node "two", 0) apart from end-of-item-1 (node "one", end)
+  // — they share a display offset but live in different list elements.
+  function locateDisp(nodes, dispPos, preferStart) {
+    var acc = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      var len = nodes[i].textContent.length, end = acc + len;
+      if (preferStart ? (dispPos >= acc && dispPos < end)
+                      : (dispPos > acc && dispPos <= end)) {
+        return { node: nodes[i], offset: dispPos - acc };
+      }
+      acc = end;
+    }
+    var last = nodes.length ? nodes[nodes.length - 1] : null;
+    return last ? { node: last, offset: last.textContent.length } : { node: null, offset: 0 };
+  }
+
+  // bias resolves leaf-boundary ambiguity: a selection START at a leaf boundary
+  // biases into the following leaf (e.g. just past an opening **), an END into
+  // the preceding leaf (just before a closing **) so emphasis stays selectable.
+  // With no bias the caret resolves by which *node* it sits in — at a node's
+  // end it stays in that node's last leaf (so end-of-item-1 ≠ start-of-item-2).
+  // Within a node, adjacent leaves are source-contiguous so either side agrees.
   function domOffsetToSourceOffset(el, node, offset, blockToken, bias) {
-    var target = displayOffset(el, node, offset);
     var leaves = leafMap(blockToken);
-    for (var i = 0; i < leaves.length; i++) {
-      var L = leaves[i];
-      var inside = (bias === 'end')
-        ? (target > L.dispStart && target <= L.dispEnd)
-        : (target >= L.dispStart && target < L.dispEnd);
-      if (inside) {
-        if (L.type === 'text') return L.rawStart + (target - L.dispStart);
-        return target <= L.dispStart ? L.rawStart : L.rawEnd; // opaque leaf: clamp
+    // Caret parked in an empty block element (empty <li>): map to the paired
+    // zero-width leaf's source position.
+    if (node && node.nodeType === 1) {
+      var empties = emptyBlockEls(el), idx = empties.indexOf(node), seen = 0;
+      if (idx >= 0) {
+        for (var e = 0; e < leaves.length; e++) {
+          if (leaves[e].dispStart !== leaves[e].dispEnd) continue;
+          if (seen === idx) return leaves[e].rawStart;
+          seen++;
+        }
       }
     }
-    if (leaves.length && target <= leaves[0].dispStart) return leaves[0].rawStart;
+    var nodes = textNodesOf(el);
+    var tnStart = nodeDispStart(nodes, node);
+    if (tnStart < 0) { // caret not in a known text node — linear fallback
+      var target = displayOffset(el, node, offset);
+      return resolveDisp(leaves, target, bias === 'start' ? true : bias === 'end' ? false : true);
+    }
+    var nodeLen = node.textContent.length;
+    var off = Math.max(0, Math.min(offset, nodeLen));
+    var dispPos = tnStart + off;
+    var preferNext = bias === 'start' ? true : bias === 'end' ? false : (off <= 0);
+    return resolveDisp(leaves, dispPos, preferNext);
+  }
+
+  // Map a linear display offset to a source offset, choosing the following leaf
+  // (preferNext) or preceding leaf at a boundary.
+  function resolveDisp(leaves, dispPos, preferNext) {
+    var endsHere = null, startsHere = null;
+    for (var i = 0; i < leaves.length; i++) {
+      var L = leaves[i];
+      if (dispPos > L.dispStart && dispPos < L.dispEnd) { // strictly interior
+        return L.type === 'text' ? L.rawStart + (dispPos - L.dispStart)
+          : (dispPos <= L.dispStart ? L.rawStart : L.rawEnd);
+      }
+      if (L.dispEnd === dispPos) endsHere = L;
+      if (L.dispStart === dispPos && !startsHere) startsHere = L;
+    }
+    if (preferNext && startsHere) return startsHere.rawStart;
+    if (!preferNext && endsHere) return endsHere.rawEnd;
+    if (startsHere) return startsHere.rawStart;
+    if (endsHere) return endsHere.rawEnd;
+    if (leaves.length && dispPos <= leaves[0].dispStart) return leaves[0].rawStart;
     return leaves.length ? leaves[leaves.length - 1].rawEnd : 0;
+  }
+
+  // --- Cross-block arrow navigation ----------------------------------------
+  //
+  // Each top-level block is its own contenteditable, so the browser's caret
+  // navigation stops at a block's edge. These helpers decide when an Up/Down
+  // press should hop to the neighbouring block. dir is -1 (Up) or +1 (Down).
+
+  // Is the caret on the block's first (Up) or last (Down) visual line? Compared
+  // geometrically against the block's edge, within ~0.6 of a line height.
+  function atBlockEdge(caretRect, blockRect, dir) {
+    var pad = Math.max(4, (caretRect.height || 16) * 0.6);
+    return dir < 0 ? (caretRect.top - blockRect.top) <= pad
+                   : (blockRect.bottom - caretRect.bottom) <= pad;
+  }
+
+  // The next/previous sibling block that is itself editable (skips read-only
+  // blocks like code/tables/hr). Returns null at the document edge.
+  function adjacentEditableSeg(div, dir) {
+    var sib = div;
+    for (;;) {
+      sib = dir < 0 ? sib.previousElementSibling : sib.nextElementSibling;
+      if (!sib) return null;
+      if (sib.getAttribute && sib.getAttribute('contenteditable') === 'true') return sib;
+    }
+  }
+
+  // Empty editable block elements (e.g. an empty <li> from a just-created list
+  // item) in document order. They host a caret but have no text node, so they
+  // can't be reached through the display-offset machinery; they pair, in order,
+  // with the zero-width leaves leafMap emits for empty items.
+  function emptyBlockEls(el) {
+    var out = [];
+    Array.prototype.forEach.call(el.querySelectorAll('li,p'), function (e) {
+      if (e.textContent === '' && !e.querySelector('li,p')) out.push(e);
+    });
+    return out;
   }
 
   function sourceOffsetToDom(el, srcOffset, blockToken) {
     var leaves = leafMap(blockToken);
-    var dispTarget = 0, placed = false;
+    var nodes = textNodesOf(el);
     for (var i = 0; i < leaves.length; i++) {
       var L = leaves[i];
+      if (L.dispStart === L.dispEnd) continue; // empty leaf — handled below
       if (srcOffset >= L.rawStart && srcOffset <= L.rawEnd) {
-        dispTarget = L.type === 'text' ? L.dispStart + (srcOffset - L.rawStart)
-          : (srcOffset <= L.rawStart ? L.dispStart : L.dispEnd);
-        placed = true;
-        break;
+        var atStart = srcOffset <= L.rawStart;
+        var dispPos = L.type === 'text' ? L.dispStart + (srcOffset - L.rawStart) : (atStart ? L.dispStart : L.dispEnd);
+        return locateDisp(nodes, dispPos, atStart);
       }
     }
-    if (!placed) {
-      if (leaves.length && srcOffset <= leaves[0].rawStart) dispTarget = 0;
-      else dispTarget = leaves.length ? leaves[leaves.length - 1].dispEnd : 0;
+    // Empty item: pair the j-th zero-width leaf with the j-th empty element.
+    var empties = emptyBlockEls(el), j = 0;
+    for (var k = 0; k < leaves.length; k++) {
+      var E = leaves[k];
+      if (E.dispStart !== E.dispEnd) continue;
+      var next = (k + 1 < leaves.length) ? leaves[k + 1].rawStart : Infinity;
+      if (srcOffset >= E.rawStart && srcOffset < next && empties[j]) return { node: empties[j], offset: 0 };
+      j++;
     }
-    return locateTextNode(el, dispTarget);
+    if (leaves.length && srcOffset <= leaves[0].rawStart) return locateDisp(nodes, 0, true);
+    var lastDisp = leaves.length ? leaves[leaves.length - 1].dispEnd : 0;
+    return locateDisp(nodes, lastDisp, false);
   }
 
   // Inline formatting elements our tokens render to, in document order.
@@ -438,9 +730,15 @@
     toggleEmphasis: toggleEmphasis,
     splitBlock: splitBlock,
     mergeBlock: mergeBlock,
+    mergeListItem: mergeListItem,
+    indentItem: indentItem,
+    outdentItem: outdentItem,
     reconcile: reconcile,
     domOffsetToSourceOffset: domOffsetToSourceOffset,
     sourceOffsetToDom: sourceOffsetToDom,
     readEditsFromDom: readEditsFromDom,
+    stripStructuralWhitespace: stripStructuralWhitespace,
+    atBlockEdge: atBlockEdge,
+    adjacentEditableSeg: adjacentEditableSeg,
   };
 });

@@ -113,3 +113,26 @@ test('an unmappable edit returns null rather than corrupting source', () => {
     assert.ok(r.raw.includes('co'), 'if accepted, must reflect the DOM');
   }
 });
+
+test('deleting an image (zero display width) folds into source', () => {
+  const t = renderBlock('alpha ![pic](shot.png) bravo');
+  const img = t.el.querySelector('img');
+  img.parentNode.removeChild(img);
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r.raw, 'alpha  bravo');
+});
+
+test('editing link text preserves the href', () => {
+  const t = renderBlock('see [docs](https://x.test/d) now');
+  const a = t.el.querySelector('a');
+  a.firstChild.textContent = 'doc';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r.raw, 'see [doc](https://x.test/d) now');
+});
+
+test('an image deletion the DOM did not make is refused', () => {
+  const t = renderBlock('alpha ![pic](shot.png) bravo');
+  // DOM untouched — reconcile must see no change, not invent one
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r.changed, false);
+});

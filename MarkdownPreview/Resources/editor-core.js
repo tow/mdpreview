@@ -456,6 +456,10 @@
   var SHOW_TEXT = 4; // NodeFilter.SHOW_TEXT
 
   function dispTextOf(token) { return token.text !== undefined ? token.text : token.raw; }
+  // What a leaf contributes to the DOM's textContent. An image contributes
+  // nothing — its alt lives in an attribute — so for display-offset purposes
+  // its width is zero, or every mapping past an image skews by the alt length.
+  function dispShownOf(token) { return token.type === 'image' ? '' : dispTextOf(token); }
 
   // Ordered leaves of a block with source (raw) and display spans. Positions are
   // found by forward-searching each leaf's raw in the block source directly —
@@ -467,6 +471,9 @@
   function leafMap(blockToken) {
     var leaves = [];
     (function walk(token) {
+      // An image is opaque: its child text token is the alt, which is an
+      // attribute in the DOM, not visible text. Descending would count it.
+      if (token.type === 'image') { leaves.push({ token: token, type: 'image' }); return; }
       var kids = childrenOf(token);
       if (!kids) { leaves.push({ token: token, type: token.type }); return; }
       for (var i = 0; i < kids.length; i++) walk(kids[i]);
@@ -479,7 +486,7 @@
       leaves[j].rawStart = idx;
       leaves[j].rawEnd = idx + raw.length;
       search = idx + raw.length;
-      var len = dispTextOf(leaves[j].token).length;
+      var len = dispShownOf(leaves[j].token).length;
       leaves[j].dispStart = disp;
       leaves[j].dispEnd = disp + len;
       disp += len;
@@ -714,7 +721,7 @@
    */
   function readEditsFromDom(el, blockToken) {
     var leaves = leafMap(blockToken);
-    var oldDisp = leaves.map(function (L) { return dispTextOf(L.token); }).join('');
+    var oldDisp = leaves.map(function (L) { return dispShownOf(L.token); }).join('');
     var newDisp = (el.textContent || '').replace(/\n+$/, '');
     if (newDisp === oldDisp) return { edits: new Map(), clean: true };
     if (domSkeleton(el).join(',') !== tokenSkeleton(blockToken).join(',')) {
@@ -759,7 +766,7 @@
   function compositeSpans(blockToken, leaves) {
     var out = [], li = { i: 0 };
     (function walk(token, isRoot) {
-      var kids = childrenOf(token);
+      var kids = token.type === 'image' ? null : childrenOf(token);
       if (!kids) {
         var L = leaves[li.i++];
         return { ds: L.dispStart, de: L.dispEnd, rs: L.rawStart, re: L.rawEnd };
@@ -791,40 +798,52 @@
     return scratch.textContent.replace(/\n+$/, '');
   }
 
-  // The structure fingerprint that must converge between DOM and source:
-  // non-empty inline formatting elements with their text, plus list items
-  // with their kind, nesting depth, and direct text. Text equality alone is
-  // blind to "the char went into the wrong item" and "source has three items,
-  // the DOM merged them into one". Empty elements are excluded on both
-  // counts: a zombie <em> renders as nothing, and the browser's leftover
-  // empty <li>s after a big deletion can't be matched to source bullets
-  // one-for-one (requiring that would make whole-list deletion
-  // unreconcilable, which is far worse than a transient ghost bullet).
-  function skeletonOfEl(el) {
-    var out = [], list = el.querySelectorAll('strong,em,a,code,del');
-    for (var i = 0; i < list.length; i++) {
-      if (list[i].textContent.length) out.push(list[i].tagName.toUpperCase() + ':' + list[i].textContent);
+  // The convergence fingerprint: the entire rendered DOM, canonicalized.
+  // Earlier versions compared projections (text, then inline runs, then list
+  // items) and every divergence bug lived in what the projection discarded —
+  // link hrefs, images, heading levels. Canonicalizing the whole tree closes
+  // the family: tag structure, text runs (merged across node splits), link
+  // targets, image sources all participate.
+  //
+  // The explicit allowlist of permitted differences:
+  //  - empty inline formatting elements (a zombie <em> renders as nothing)
+  //  - empty <li>/<p> (the browser's leftovers after a big deletion can't be
+  //    matched one-for-one to source bullets; requiring it would make
+  //    whole-list deletion unreconcilable — worse than a transient ghost)
+  //  - element attributes other than href/src/alt (classes, data-*)
+  //  - `base` prefix on href/src (the live DOM resolves relative paths)
+  var INLINE_FMT = { STRONG: 1, EM: 1, A: 1, CODE: 1, DEL: 1 };
+  function canonicalOfEl(el, base) {
+    var out = [], buf = '';
+    function flush() { if (buf) { out.push(JSON.stringify(buf)); buf = ''; } }
+    function deBase(v) {
+      v = v || '';
+      return base && v.indexOf(base) === 0 ? v.slice(base.length) : v;
     }
-    var items = el.querySelectorAll('li');
-    for (var j = 0; j < items.length; j++) {
-      var li = items[j], depth = 0;
-      for (var q = li.parentNode; q && q !== el; q = q.parentNode) {
-        var tg = (q.tagName || '').toUpperCase();
-        if (tg === 'UL' || tg === 'OL') depth++;
+    (function walk(node) {
+      for (var n = node.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === 3) { buf += n.textContent; continue; }
+        if (n.nodeType !== 1) continue;
+        var tag = n.tagName.toUpperCase();
+        if (tag === 'IMG') { flush(); out.push('IMG[' + deBase(n.getAttribute('src')) + '|' + (n.getAttribute('alt') || '') + ']'); continue; }
+        if (tag === 'BR') { flush(); out.push('BR'); continue; }
+        var empty = !n.textContent.length && !n.querySelector('img');
+        if (empty && (INLINE_FMT[tag] || tag === 'LI' || tag === 'P' || tag === 'UL' || tag === 'OL')) continue;
+        flush();
+        out.push(tag + (tag === 'A' ? '[' + deBase(n.getAttribute('href')) + ']' : '') + '(');
+        walk(n);
+        flush();
+        out.push(')');
       }
-      var kind = (li.parentNode && (li.parentNode.tagName || '').toUpperCase() === 'OL') ? 'OL' : 'UL';
-      var clone = li.cloneNode(true);
-      var subs = clone.querySelectorAll('ul,ol');
-      for (var s = 0; s < subs.length; s++) subs[s].parentNode.removeChild(subs[s]);
-      if (clone.textContent.length) out.push(kind + depth + ':' + clone.textContent);
-    }
-    return out.join('|');
+    })(el);
+    flush();
+    return out.join('');
   }
-  function renderedSkeletonOf(doc, md, marked) {
+  function renderedCanonicalOf(doc, md, marked) {
     var scratch = doc.createElement('div');
     try { scratch.innerHTML = marked.parse(md); } catch (_) { return null; }
     stripStructuralWhitespace(scratch);
-    return skeletonOfEl(scratch);
+    return canonicalOfEl(scratch);
   }
 
   // Does `cand` still lex as (at most) one block that renders exactly
@@ -846,7 +865,7 @@
     var disp = '';
     for (var i = 0; i < toks.length; i++) {
       if (toks[i].type === 'space') continue;
-      disp += leafMap(toks[i]).map(function (L) { return dispTextOf(L.token); }).join('');
+      disp += leafMap(toks[i]).map(function (L) { return dispShownOf(L.token); }).join('');
     }
     return disp;
   }
@@ -858,11 +877,10 @@
    *         visible text is now gone — caller may drop/convert the block), or
    *         null when the DOM state can't be mapped to source (caller reverts).
    */
-  function reconcileDomEdit(el, blockToken, marked) {
+  function reconcileDomEdit(el, blockToken, marked, base) {
     var leaves = leafMap(blockToken);
-    var oldDisp = leaves.map(function (L) { return dispTextOf(L.token); }).join('');
+    var oldDisp = leaves.map(function (L) { return dispShownOf(L.token); }).join('');
     var newDisp = (el.textContent || '').replace(/\n+$/, '');
-    if (newDisp === oldDisp) return { changed: false };
     var raw = blockToken.raw;
     var minLen = Math.min(oldDisp.length, newDisp.length);
     var p = 0;
@@ -907,12 +925,38 @@
       return out;
     }
 
-    var domSkel = skeletonOfEl(el);
+    var domCanon = canonicalOfEl(el, base);
     function accept(cand) {
       var tok = relexMatches(el.ownerDocument, cand, newDisp, marked);
       if (tok === null) return null;
-      if (renderedSkeletonOf(el.ownerDocument, cand, marked) !== domSkel) return null;
+      if (renderedCanonicalOf(el.ownerDocument, cand, marked) !== domCanon) return null;
       return { changed: true, raw: cand, empty: newDisp === '' };
+    }
+
+    if (newDisp === oldDisp) {
+      if (renderedCanonicalOf(el.ownerDocument, raw, marked) === domCanon) return { changed: false };
+      // Text-identical but structurally different: only zero-display-width
+      // content (images) can change without moving a character. Match the
+      // DOM's images against the source's in order; unmatched source images
+      // were deleted — splice their raws out.
+      var domImgs = [], imgs = el.querySelectorAll('img');
+      for (var di = 0; di < imgs.length; di++) {
+        var sv = imgs[di].getAttribute('src') || '';
+        if (base && sv.indexOf(base) === 0) sv = sv.slice(base.length);
+        domImgs.push(sv + '|' + (imgs[di].getAttribute('alt') || ''));
+      }
+      var gone = [], dp = 0;
+      for (var ig = 0; ig < leaves.length; ig++) {
+        var IL = leaves[ig];
+        if (IL.token.type !== 'image') continue;
+        var sig = (IL.token.href || '') + '|' + (IL.token.text || '');
+        if (dp < domImgs.length && domImgs[dp] === sig) { dp++; continue; }
+        gone.push(IL);
+      }
+      if (!gone.length || dp !== domImgs.length) return null;
+      var out0 = raw;
+      for (var gi = gone.length - 1; gi >= 0; gi--) out0 = out0.slice(0, gone[gi].rawStart) + out0.slice(gone[gi].rawEnd);
+      return accept(out0);
     }
     // Typed text containing markdown specials (*, `, [, …) must reach the
     // source escaped, or it stops being literal there.
@@ -992,8 +1036,8 @@
     reconcileDomEdit: reconcileDomEdit,
     displayTextOf: displayTextOf,
     renderedDisplayOf: renderedDisplayOf,
-    renderedSkeletonOf: renderedSkeletonOf,
-    skeletonOfEl: skeletonOfEl,
+    renderedCanonicalOf: renderedCanonicalOf,
+    canonicalOfEl: canonicalOfEl,
     stripStructuralWhitespace: stripStructuralWhitespace,
     atBlockEdge: atBlockEdge,
     adjacentEditableSeg: adjacentEditableSeg,

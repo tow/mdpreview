@@ -46,14 +46,16 @@ function genInline(rnd) {
   const bits = [];
   for (let i = 0, n = irange(rnd, 1, 4); i < n; i++) {
     const w = pick(rnd, words);
-    bits.push(pick(rnd, [w, w, w, `**${w}**`, `*${w}*`, '`' + w + '`']));
+    bits.push(pick(rnd, [w, w, w, `**${w}**`, `*${w}*`, '`' + w + '`',
+      `[${w}](https://x.test/${w})`, `![${w}](${w}.png)`]));
   }
   return bits.join(' ');
 }
 function genBlock(rnd) {
-  switch (irange(rnd, 1, 5)) {
+  switch (irange(rnd, 1, 6)) {
     case 1: return '#'.repeat(irange(rnd, 1, 3)) + ' ' + genInline(rnd);
     case 2: return genInline(rnd);
+    case 6: return '> ' + genInline(rnd);
     default: {
       const ordered = rnd() < 0.3;
       const items = [];
@@ -239,7 +241,7 @@ function domDisplay(t) {
 // whatever is typed into it (and making Cmd+I act on the wrong model).
 // The structural fingerprint is the core's own — the fuzzer must judge with
 // the same eyes the editor verifies with, or the two drift apart.
-function skeleton(root) { return core.skeletonOfEl(root); }
+function skeleton(root) { return core.canonicalOfEl(root); }
 function sourceSkeleton(t) {
   const parts = [];
   for (const seg of t.win._segments) {

@@ -590,21 +590,25 @@
             if (!seg || seg.transient || !seg.token) return true; // no source to fold into
             var domText = (div.textContent || '').replace(/\n+$/, '');
             var res = EditorCore.readEditsFromDom(div, seg.token);
-            if (res.clean && res.edits.size === 0) return true; // no change
-            if (res.clean) {
+            var domCanon = EditorCore.canonicalOfEl(div, _baseURL);
+            if (res.clean && res.edits.size === 0 &&
+                EditorCore.renderedCanonicalOf(document, seg.raw, marked) === domCanon) {
+                return true; // no change, in text or structure
+            }
+            if (res.clean && res.edits.size > 0) {
                 // Fast path: single-leaf substitution — but verify it. Emptying
                 // a leaf inside an emphasis run leaves orphaned delimiters
                 // (**f** → ****) which render as literal stars, diverging from
                 // the DOM. Anything unverifiable falls to the reconciler.
                 var cand = EditorCore.applyLeafEdits(seg, res.edits);
                 if (EditorCore.renderedDisplayOf(document, cand, marked) === domText &&
-                    EditorCore.renderedSkeletonOf(document, cand, marked) === EditorCore.skeletonOfEl(div)) {
+                    EditorCore.renderedCanonicalOf(document, cand, marked) === domCanon) {
                     elog('flush seg=' + i + ' leaf ' + exc(seg.raw) + ' -> ' + exc(cand));
                     seg.raw = cand; relexSeg(seg);
                     return true;
                 }
             }
-            var rec = EditorCore.reconcileDomEdit(div, seg.token, marked);
+            var rec = EditorCore.reconcileDomEdit(div, seg.token, marked, _baseURL);
             if (rec == null) {
                 elog('flush seg=' + i + ' FAILED — DOM edit not reconcilable, raw=' + exc(seg.raw) + ' dom=' + exc(div.textContent));
                 return false;

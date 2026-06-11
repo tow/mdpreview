@@ -31,6 +31,7 @@ struct MarkdownWebView: NSViewRepresentable {
         config.userContentController.add(context.coordinator, name: "paginationDone")
         config.userContentController.add(context.coordinator, name: "consoleLog")
         config.userContentController.add(context.coordinator, name: "documentEdited")
+        config.userContentController.add(context.coordinator, name: "editorLog")
         let consoleScript = WKUserScript(
             source: "var _origLog = console.log; console.log = function() { var msg = Array.from(arguments).map(String).join(' '); _origLog.apply(console, arguments); window.webkit.messageHandlers.consoleLog.postMessage(msg); };",
             injectionTime: .atDocumentStart,
@@ -138,7 +139,36 @@ struct MarkdownWebView: NSViewRepresentable {
         var lastDiskChangeTrigger: Int = 0
         var onDocumentEdited: ((String) -> Void)?
 
+        // Editing transcript: every editing event/outcome the JS editor logs,
+        // appended to ~/Library/Logs/MarkdownPreview/editor.log so a bug report
+        // can include the exact action sequence that produced it.
+        private lazy var editorLogHandle: FileHandle? = {
+            let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Logs/MarkdownPreview", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent("editor.log")
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            let handle = try? FileHandle(forWritingTo: url)
+            handle?.seekToEndOfFile()
+            return handle
+        }()
+        private let editorLogStamp: DateFormatter = {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+            return f
+        }()
+        private func appendEditorLog(_ line: String) {
+            guard let data = "\(editorLogStamp.string(from: Date())) \(line)\n".data(using: .utf8) else { return }
+            editorLogHandle?.write(data)
+        }
+
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "editorLog" {
+                if let line = message.body as? String { appendEditorLog(line) }
+                return
+            }
             if message.name == "consoleLog" {
                 print("[JS] \(message.body)")
                 return

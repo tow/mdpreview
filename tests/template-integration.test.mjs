@@ -175,6 +175,49 @@ function selectAndPressCmd(win, text, key) {
   win.getSelection().anchorNode.parentNode.dispatchEvent(ev);
 }
 
+// Select from the text node containing `fromText` to the one containing
+// `toText` (whole-node endpoints), dispatch the delete beforeinput, and — when
+// the handler doesn't claim it — mutate the DOM the way the browser would.
+function selectAndDelete(t, fromText, toText) {
+  const doc = t.win.document, sel = t.win.getSelection(), r = doc.createRange();
+  const walk = doc.createTreeWalker(doc.getElementById('content'), t.win.NodeFilter.SHOW_TEXT);
+  let n, a = null, b = null;
+  while ((n = walk.nextNode())) {
+    if (!a && n.textContent.includes(fromText)) a = n;
+    if (n.textContent.includes(toText)) b = n;
+  }
+  r.setStart(a, a.textContent.indexOf(fromText));
+  r.setEnd(b, b.textContent.indexOf(toText) + toText.length);
+  sel.removeAllRanges(); sel.addRange(r);
+  const ev = new t.win.InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true });
+  (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentNode).dispatchEvent(ev);
+  if (!ev.defaultPrevented) r.deleteContents();
+}
+
+test('deleting a whole list section then Return does not resurrect it', async () => {
+  const t = await setup('## Heading\n\n- one\n- two\n- three\n');
+  selectAndDelete(t, 'one', 'three');
+  beforeInput(t.win, 'insertParagraph');
+  assert.ok(!t.md().includes('two'), 'deleted items resurrected in source: ' + JSON.stringify(t.md()));
+  assert.ok(!t.doc.getElementById('content').textContent.includes('two'),
+    'deleted items resurrected in DOM');
+  assert.ok(t.md().includes('## Heading'), 'heading must survive');
+});
+
+test('a multi-leaf deletion then Cmd+I elsewhere keeps both edits', async () => {
+  const t = await setup('keep **gone** also\n\nhello world\n');
+  selectAndDelete(t, 'gone', 'gone'); // deletes the whole bold run's text
+  selectAndPressCmd(t.win, 'world', 'i');
+  assert.ok(!t.md().includes('gone'), 'deleted text resurrected: ' + JSON.stringify(t.md()));
+  assert.ok(t.md().includes('*world*'), 'italic lost: ' + JSON.stringify(t.md()));
+});
+
+test('a selection spanning two blocks deletes across them', async () => {
+  const t = await setup('alpha bravo\n\ncharlie delta\n');
+  selectAndDelete(t, 'bravo', 'charlie');
+  assert.equal(t.md(), 'alpha  delta\n');
+});
+
 test('Cmd+B then Cmd+I on the same word stacks bold and italic', async () => {
   const t = await setup('hello world\n');
   selectAndPressCmd(t.win, 'world', 'b');

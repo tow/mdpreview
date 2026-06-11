@@ -518,7 +518,9 @@
     var w = doc.createTreeWalker(el, SHOW_TEXT);
     var kill = [], n;
     while ((n = w.nextNode())) {
-      if (!/^\s*$/.test(n.textContent)) continue;
+      // Only marked's block pretty-printing ("\n" between <li>s etc.) — an
+      // inline whitespace-only node (the space in "**a** **b**") is content.
+      if (!/^\s*$/.test(n.textContent) || n.textContent.indexOf('\n') < 0) continue;
       var p = n.parentNode, inPre = false;
       while (p && p !== el) {
         var tag = (p.tagName || '').toUpperCase();
@@ -739,6 +741,185 @@
     return { edits: edits, clean: true };
   }
 
+  // --- Generalized DOM edit reconciliation ----------------------------------
+  //
+  // readEditsFromDom handles the fast path: an edit confined to one text leaf.
+  // Everything else the browser can do to a contenteditable block — selection
+  // deletes spanning leaves, items, or whole formatting runs — lands here.
+  // The contract that matters: an edit that exists in the DOM must either be
+  // folded into the source or be reported as impossible; it must never sit
+  // silently in the DOM to be resurrected by the next re-render.
+
+  // Raw + display spans for every composite inline/item token, outer-first.
+  // A composite's display span is the union of its descendant leaves; its raw
+  // span is located by searching for token.raw at/before the first leaf (the
+  // delimiters/markers precede it). Nested-list raws are deindented by marked
+  // and may not be locatable — those composites are skipped (the relex
+  // verification backstop covers anything missed).
+  function compositeSpans(blockToken, leaves) {
+    var out = [], li = { i: 0 };
+    (function walk(token, isRoot) {
+      var kids = childrenOf(token);
+      if (!kids) {
+        var L = leaves[li.i++];
+        return { ds: L.dispStart, de: L.dispEnd, rs: L.rawStart, re: L.rawEnd };
+      }
+      var ds = Infinity, de = -Infinity, rs = Infinity, re = -Infinity;
+      for (var k = 0; k < kids.length; k++) {
+        var sp = walk(kids[k], false);
+        ds = Math.min(ds, sp.ds); de = Math.max(de, sp.de);
+        rs = Math.min(rs, sp.rs); re = Math.max(re, sp.re);
+      }
+      if (!isRoot && isFinite(rs)) {
+        var idx = blockToken.raw.lastIndexOf(token.raw, rs);
+        if (idx >= 0 && idx + token.raw.length >= re) { rs = idx; re = idx + token.raw.length; }
+        out.push({ token: token, ds: ds, de: de, rs: rs, re: re });
+      }
+      return { ds: ds, de: de, rs: rs, re: re };
+    })(blockToken, true);
+    return out;
+  }
+
+  // What `md` actually renders to, through the same pipeline the editor uses
+  // for its blocks (marked.parse + structural-whitespace strip). The lexer's
+  // token text is NOT a safe proxy: e.g. a paragraph's leading space survives
+  // in the token but is dropped by the renderer.
+  function renderedDisplayOf(doc, md, marked) {
+    var scratch = doc.createElement('div');
+    try { scratch.innerHTML = marked.parse(md); } catch (_) { return null; }
+    stripStructuralWhitespace(scratch);
+    return scratch.textContent.replace(/\n+$/, '');
+  }
+
+  // Does `cand` still lex as (at most) one block that renders exactly
+  // `wantDisp`? The acceptance test for any reconciled source.
+  function relexMatches(doc, cand, wantDisp, marked) {
+    var toks;
+    try { toks = marked.lexer(cand); } catch (_) { return null; }
+    var real = toks.filter(function (t) { return t.type !== 'space'; });
+    if (real.length > 1) return null;
+    if (renderedDisplayOf(doc, cand, marked) !== wantDisp) return null;
+    return real.length ? real[0] : false; // false = block vanished entirely
+  }
+
+  // Visible text a markdown fragment renders to — the editor's convergence
+  // currency: source and DOM agree iff their display texts are equal.
+  function displayTextOf(md, marked) {
+    var toks;
+    try { toks = marked.lexer(md); } catch (_) { return null; }
+    var disp = '';
+    for (var i = 0; i < toks.length; i++) {
+      if (toks[i].type === 'space') continue;
+      disp += leafMap(toks[i]).map(function (L) { return dispTextOf(L.token); }).join('');
+    }
+    return disp;
+  }
+
+  /**
+   * Fold an arbitrary text edit in `el` back into the block's source.
+   * Returns { changed:false } if DOM and source agree,
+   *         { changed:true, raw, empty } when reconciled (empty: the block's
+   *         visible text is now gone — caller may drop/convert the block), or
+   *         null when the DOM state can't be mapped to source (caller reverts).
+   */
+  function reconcileDomEdit(el, blockToken, marked) {
+    var leaves = leafMap(blockToken);
+    var oldDisp = leaves.map(function (L) { return dispTextOf(L.token); }).join('');
+    var newDisp = (el.textContent || '').replace(/\n+$/, '');
+    if (newDisp === oldDisp) return { changed: false };
+    var raw = blockToken.raw;
+    var minLen = Math.min(oldDisp.length, newDisp.length);
+    var p = 0;
+    while (p < minLen && oldDisp[p] === newDisp[p]) p++;
+    var s = 0;
+    while (s < minLen - p && oldDisp[oldDisp.length - 1 - s] === newDisp[newDisp.length - 1 - s]) s++;
+    var oldEnd = oldDisp.length - s;
+    var newSub = newDisp.slice(p, newDisp.length - s);
+    var composites = compositeSpans(blockToken, leaves);
+
+    // Edit edge display→source. Strictly inside a leaf: text leaves map by
+    // offset, opaque leaves can't host an edge. At a boundary both edges bind
+    // to the leaf that *ends* there, so the source between the edges keeps the
+    // markers/delimiters of everything deleted (and they go with it).
+    function srcAt(disp) {
+      var endsHere = null, startsHere = null;
+      for (var i = 0; i < leaves.length; i++) {
+        var L = leaves[i];
+        if (L.dispStart === L.dispEnd) continue;
+        if (disp > L.dispStart && disp < L.dispEnd) {
+          if (L.type === 'text') return L.rawStart + (disp - L.dispStart);
+          // Opaque leaf (codespan, escape): its display text appears verbatim
+          // inside its raw between the delimiters — map through that.
+          var inner = L.token.raw.indexOf(dispTextOf(L.token));
+          return inner >= 0 ? L.rawStart + inner + (disp - L.dispStart) : null;
+        }
+        if (L.dispEnd === disp) endsHere = L;
+        if (L.dispStart === disp && !startsHere) startsHere = L;
+      }
+      if (endsHere) return endsHere.rawEnd;
+      if (startsHere) return startsHere.rawStart;
+      return leaves.length ? leaves[0].rawStart : null;
+    }
+
+    function accept(cand) {
+      var tok = relexMatches(el.ownerDocument, cand, newDisp, marked);
+      if (tok === null) return null;
+      return { changed: true, raw: cand, empty: newDisp === '' };
+    }
+    // Typed text containing markdown specials (*, `, [, …) must reach the
+    // source escaped, or it stops being literal there.
+    function escaped(text) { return text.replace(/([\\`*_~\[\]])/g, '\\$1'); }
+
+    // Candidate 1: splice the source between the mapped edges, widened over
+    // any composite (emphasis run, link, list item) whose entire display text
+    // fell inside the deletion — its delimiters/marker must go too.
+    var a = srcAt(p), b = srcAt(oldEnd);
+    if (a != null && b != null && a <= b) {
+      for (var c = 0; c < composites.length; c++) {
+        var C = composites[c];
+        if (C.ds < C.de && C.ds >= p && C.de <= oldEnd) {
+          a = Math.min(a, C.rs); b = Math.max(b, C.re);
+        }
+      }
+      var r1 = accept(raw.slice(0, a) + newSub + raw.slice(b));
+      if (!r1 && newSub) r1 = accept(raw.slice(0, a) + escaped(newSub) + raw.slice(b));
+      if (r1) return r1;
+    }
+
+    // Candidate 2: distribute the edit per-leaf (a partially-deleted emphasis
+    // run keeps its delimiters around the surviving text), deleting fully-
+    // covered composites whole. Handles edits candidate 1 garbles, e.g. a
+    // deletion running from inside a bold run into the text after it.
+    var ops = [];
+    for (var j = 0; j < leaves.length; j++) {
+      var L2 = leaves[j];
+      if (L2.dispStart === L2.dispEnd || L2.dispEnd <= p || L2.dispStart >= oldEnd) continue;
+      var from = Math.max(p, L2.dispStart), to = Math.min(oldEnd, L2.dispEnd);
+      var full = from === L2.dispStart && to === L2.dispEnd;
+      if (!full && L2.type !== 'text') return null;
+      ops.push({ start: full ? L2.rawStart : L2.rawStart + (from - L2.dispStart),
+                 end: full ? L2.rawEnd : L2.rawStart + (to - L2.dispStart) });
+    }
+    if (!ops.length) return null;
+    for (var c2 = 0; c2 < composites.length; c2++) {
+      var C2 = composites[c2];
+      if (!(C2.ds < C2.de && C2.ds >= p && C2.de <= oldEnd)) continue;
+      ops = ops.filter(function (o) { return o.start < C2.rs || o.end > C2.re; });
+      ops.push({ start: C2.rs, end: C2.re });
+    }
+    ops.sort(function (x, y) { return x.start - y.start; });
+    var merged = [];
+    for (var m = 0; m < ops.length; m++) {
+      var last = merged[merged.length - 1];
+      if (last && ops[m].start <= last.end) last.end = Math.max(last.end, ops[m].end);
+      else merged.push({ start: ops[m].start, end: ops[m].end });
+    }
+    var insertAt = merged[0].start, out = raw;
+    for (var q = merged.length - 1; q >= 0; q--) out = out.slice(0, merged[q].start) + out.slice(merged[q].end);
+    return accept(out.slice(0, insertAt) + newSub + out.slice(insertAt))
+        || (newSub ? accept(out.slice(0, insertAt) + escaped(newSub) + out.slice(insertAt)) : null);
+  }
+
   return {
     segment: segment,
     isEditableBlock: isEditableBlock,
@@ -754,6 +935,9 @@
     domOffsetToSourceOffset: domOffsetToSourceOffset,
     sourceOffsetToDom: sourceOffsetToDom,
     readEditsFromDom: readEditsFromDom,
+    reconcileDomEdit: reconcileDomEdit,
+    displayTextOf: displayTextOf,
+    renderedDisplayOf: renderedDisplayOf,
     stripStructuralWhitespace: stripStructuralWhitespace,
     atBlockEdge: atBlockEdge,
     adjacentEditableSeg: adjacentEditableSeg,

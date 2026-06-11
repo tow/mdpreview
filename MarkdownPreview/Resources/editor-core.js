@@ -211,11 +211,22 @@
     for (var i = 0; i < toks.length; i++) joined += toks[i].raw;
     if (joined !== frag) return null; // positions unknowable — out of scope
     var text = [];
-    function emit(t, attrs) {
+    // Does a token render as bare text (merging into a neighbouring text
+    // node) rather than as an element?
+    function rendersAsText(t) { return t && (t.type === 'text' || t.type === 'escape'); }
+    function emit(t, attrs, prevT, nextT) {
       var k, a;
       switch (t.type) {
         case 'text': {
           if (t.tokens && t.tokens.length) return emitList(t.tokens, attrs);
+          // A whitespace-only run containing a newline, with elements (or the
+          // fragment edge) on both sides, renders as an inter-element text
+          // node that stripStructuralWhitespace removes — it contributes
+          // nothing to the display currency. Its bytes live on in the
+          // provenance span. Adjacent to bare text it merges into that node
+          // and survives.
+          if (/^\s*$/.test(t.text) && t.text.indexOf('\n') >= 0 &&
+              !rendersAsText(prevT) && !rendersAsText(nextT)) return true;
           var dec = decodeEntities(t.text);
           if (dec === null) return false;
           for (k = 0; k < dec.length; k++) text.push({ ch: dec.charAt(k), attrs: copyAttrs(attrs) });
@@ -242,13 +253,15 @@
       }
     }
     function emitList(list, attrs) {
-      for (var j = 0; j < list.length; j++) if (!emit(list[j], attrs)) return false;
+      for (var j = 0; j < list.length; j++) {
+        if (!emit(list[j], attrs, list[j - 1], list[j + 1])) return false;
+      }
       return true;
     }
     var prov = [];
     for (var n = 0; n < toks.length; n++) {
       var from = text.length;
-      if (!emit(toks[n], {})) return null;
+      if (!emit(toks[n], {}, toks[n - 1], toks[n + 1])) return null;
       prov.push({ from: from, to: text.length, raw: toks[n].raw, chars: text.slice(from).map(copyChar) });
     }
     return { text: text, prov: prov };
@@ -435,6 +448,409 @@
   }
 
   function printInline(text, prov, marked) { return printInlineParts(text, prov, marked).s; }
+
+  // --- StyledDoc model — block layer ------------------------------------------
+  //
+  // Block shapes (discriminated on .kind):
+  //   { kind:'paragraph'|'quote', text, prov, raw, sep }
+  //   { kind:'heading', level, text, prov, raw, sep }
+  //   { kind:'listItem', depth, marker, text, prov, raw, sep }
+  //     marker: { bullet:'-'|'*'|'+' } | { ordered:true, num, delim:'.'|')' }
+  //   { kind:'opaque', raw }
+  // raw is the block's original source bytes — print returns it verbatim; an
+  // op (or diff) nulls it. sep is the trailing newline run (including a loose
+  // list's blank line) so canonical reprints keep the block spacing.
+
+  var LIST_LINE_M = /^([ \t]*)([-*+]|\d+[.)])([ \t]*)(.*)$/;
+  // Item content that marked would lex as block structure inside the item —
+  // out of the line-wise model's scope.
+  var ITEM_BLOCK_HAZARD = /^(\[[ xX]\][ \t]|#{1,6}[ \t]|>|([-*+]|\d+[.)])([ \t]|$))/;
+
+  /**
+   * Parse a list segment line-wise into a flat run of listItem blocks. marked
+   * classifies the segment, but its nested raws are deindented and empty-item
+   * raws truncated, so positions and depths come from the source lines.
+   * Nesting follows marked's content-column rule: a line is nested when its
+   * indent reaches the parent's content column (2 for "- ", 3 for "1. ").
+   * Returns null (out of model) for continuation lines, task items, or
+   * block-level item content.
+   */
+  function parseListBlocks(raw, marked) {
+    var blocks = [], stack = [], pos = 0, n = raw.length;
+    while (pos < n) {
+      var nl = raw.indexOf('\n', pos);
+      var lineEnd = nl < 0 ? n : nl;
+      var line = raw.slice(pos, lineEnd);
+      var lineRaw = raw.slice(pos, nl < 0 ? n : nl + 1);
+      var m = line.match(LIST_LINE_M);
+      if (!m || m[1].indexOf('\t') >= 0) {
+        if (/^[ \t]*$/.test(line) && blocks.length) {
+          // blank line inside the segment (loose list) — part of the previous
+          // item's separator
+          blocks[blocks.length - 1].sep += lineRaw;
+          blocks[blocks.length - 1].raw += lineRaw;
+          pos = lineEnd + 1;
+          continue;
+        }
+        return null; // continuation line — out of model
+      }
+      var content = m[4];
+      if (content !== '' && m[3] === '') return null; // "-x" — not a list line
+      if (ITEM_BLOCK_HAZARD.test(content)) return null;
+      var pr = content === '' ? { text: [], prov: [] } : parseInline(content, marked);
+      if (!pr) return null;
+      var W = m[1].length, mlen = m[2].length;
+      while (stack.length && W < stack[stack.length - 1].content) {
+        if (W >= stack[stack.length - 1].indent) break;
+        stack.pop();
+      }
+      if (!stack.length || W >= stack[stack.length - 1].content) {
+        stack.push({ indent: W, content: W + mlen + 1 });
+      } else {
+        stack[stack.length - 1] = { indent: W, content: W + mlen + 1 };
+      }
+      blocks.push({
+        kind: 'listItem',
+        depth: stack.length - 1,
+        marker: /\d/.test(m[2].charAt(0))
+          ? { ordered: true, num: parseInt(m[2], 10), delim: m[2].charAt(m[2].length - 1) }
+          : { bullet: m[2] },
+        text: pr.text,
+        prov: pr.prov,
+        raw: lineRaw,
+        sep: nl < 0 ? '' : '\n',
+      });
+      pos = lineEnd + 1;
+    }
+    return blocks.length ? blocks : null;
+  }
+
+  function parseBlocks(segRaw, marked) {
+    var token;
+    try { token = marked.lexer(segRaw)[0]; } catch (_) { return null; }
+    if (!token) return null;
+    var content, pr, sep;
+    switch (token.type) {
+      case 'paragraph':
+        content = segRaw.replace(/\n+$/, '');
+        pr = parseInline(content, marked);
+        if (!pr) return null;
+        return [{ kind: 'paragraph', text: pr.text, prov: pr.prov, raw: segRaw, sep: segRaw.slice(content.length) }];
+      case 'heading':
+        pr = parseInline(token.text, marked);
+        if (!pr) return null;
+        sep = (segRaw.match(/\n*$/) || [''])[0];
+        return [{ kind: 'heading', level: token.depth, text: pr.text, prov: pr.prov, raw: segRaw, sep: sep }];
+      case 'blockquote': {
+        content = segRaw.replace(/\n+$/, '');
+        var lines = content.split('\n'), inner = [];
+        for (var i = 0; i < lines.length; i++) {
+          var qm = lines[i].match(/^>[ \t]?(.*)$/);
+          if (!qm) return null; // lazy continuation — out of model
+          inner.push(qm[1]);
+        }
+        var joined = inner.join('\n');
+        var innerToks;
+        try { innerToks = marked.lexer(joined); } catch (_) { return null; }
+        var real = innerToks.filter(function (t) { return t.type !== 'space'; });
+        if (real.length !== 1 || real[0].type !== 'paragraph') return null; // block structure inside the quote
+        pr = parseInline(joined, marked);
+        if (!pr) return null;
+        return [{ kind: 'quote', text: pr.text, prov: pr.prov, raw: segRaw, sep: segRaw.slice(content.length) }];
+      }
+      case 'list':
+        return parseListBlocks(segRaw, marked);
+      default:
+        return null;
+    }
+  }
+
+  /** Parse a whole document; segments outside the model become opaque blocks. */
+  function parseDoc(md, marked) {
+    var segs = segment(md, marked), blocks = [];
+    for (var i = 0; i < segs.length; i++) {
+      var bs = segs[i].editable ? parseBlocks(segs[i].raw, marked) : null;
+      if (bs) blocks.push.apply(blocks, bs);
+      else blocks.push({ kind: 'opaque', raw: segs[i].raw });
+    }
+    return { blocks: blocks };
+  }
+
+  // A canonically-printed line must not re-lex as block structure (a printed
+  // paragraph line starting "- " would become a list). Escape the marker.
+  function guardBlockPrefix(line) {
+    var m = line.match(/^([ \t]*)(#{1,6})[ \t]/);
+    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
+    m = line.match(/^([ \t]*)([-*+])([ \t]|$)/);
+    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
+    m = line.match(/^([ \t]*)(\d+)([.)])([ \t]|$)/);
+    if (m) return m[1] + m[2] + '\\' + line.slice(m[1].length + m[2].length);
+    m = line.match(/^([ \t]*)(=+|-+)[ \t]*$/); // setext underline / hr
+    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
+    if (line.charAt(0) === '>') return '\\' + line;
+    return line;
+  }
+
+  function markerTextOf(marker) {
+    if (marker && marker.ordered) return marker.num + marker.delim;
+    return (marker && marker.bullet) || '-';
+  }
+
+  /**
+   * Print a run of blocks. Untouched blocks (raw non-null) pass through
+   * byte-identical; touched blocks print canonically, with list indentation
+   * derived from the actual parent marker width (marked's content-column
+   * nesting rule — 2 spaces under "- ", 3 under "1. ").
+   */
+  function printBlocks(blocks, marked) {
+    var out = '', sibIndent = [], childIndent = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i];
+      if (b.kind !== 'listItem') { sibIndent = []; childIndent = []; }
+      if (b.kind === 'opaque') { out += b.raw; continue; }
+      if (b.kind === 'listItem') {
+        var indent, mk;
+        if (b.raw != null) {
+          var lm = b.raw.match(LIST_LINE_M);
+          indent = lm ? lm[1] : '';
+          mk = lm ? lm[2] : '-';
+        } else {
+          indent = sibIndent[b.depth] != null ? sibIndent[b.depth]
+            : childIndent[b.depth - 1] != null ? childIndent[b.depth - 1]
+            : new Array(b.depth + 1).join('  ');
+          mk = markerTextOf(b.marker);
+        }
+        sibIndent.length = b.depth + 1;
+        childIndent.length = b.depth + 1;
+        sibIndent[b.depth] = indent;
+        childIndent[b.depth] = indent + new Array(mk.length + 2).join(' ');
+        if (b.raw != null) { out += b.raw; continue; }
+        var sepL = b.sep != null ? b.sep : '\n';
+        if (!b.text.length) {
+          // a bare marker (no trailing space) round-trips; an indented empty
+          // "-" would lex as a setext underline, so it becomes "*"
+          if (b.depth > 0 && mk === '-') mk = '*';
+          out += indent + mk + sepL;
+          continue;
+        }
+        out += indent + mk + ' ' + printInline(canonText(b.text), b.prov || null, marked) + sepL;
+        continue;
+      }
+      if (b.raw != null) { out += b.raw; continue; }
+      var sep = b.sep != null ? b.sep : '\n';
+      var inline = printInline(canonText(b.text), b.prov || null, marked);
+      if (b.kind === 'heading') {
+        out += new Array((b.level || 1) + 1).join('#') + ' ' + inline + sep;
+      } else if (b.kind === 'quote') {
+        out += inline.split('\n').map(function (l) {
+          l = guardBlockPrefix(l);
+          return l ? '> ' + l : '>';
+        }).join('\n') + sep;
+      } else { // paragraph
+        out += inline.split('\n').map(guardBlockPrefix).join('\n') + sep;
+      }
+    }
+    return out;
+  }
+
+  function printDoc(doc, marked) { return printBlocks(doc.blocks, marked); }
+
+  // --- DOM readback ------------------------------------------------------------
+  //
+  // The promoted canonicalOfEl: the same walk and the same allowlist (empty
+  // inline formatting elements and empty <p> are browser leftovers and are
+  // ignored), but producing model blocks instead of a fingerprint string.
+  // Returns null when the DOM holds structure outside the model — the caller
+  // refuses the edit rather than guessing.
+
+  var READ_INLINE_TAGS = { STRONG: 'b', B: 'b', EM: 'i', I: 'i', CODE: 'code', DEL: 'del', S: 'del', STRIKE: 'del' };
+
+  function readBlocksFromDom(el, base) {
+    var root = el.cloneNode(true);
+    stripStructuralWhitespace(root);
+    function deBase(v) {
+      v = v || '';
+      return base && v.indexOf(base) === 0 ? v.slice(base.length) : v;
+    }
+    var blocks = [];
+
+    function readInlineNode(n, attrs, out) {
+      if (n.nodeType === 3) {
+        var s = n.textContent;
+        for (var k = 0; k < s.length; k++) out.push({ ch: s.charAt(k), attrs: copyAttrs(attrs) });
+        return true;
+      }
+      if (n.nodeType !== 1) return true;
+      var tag = n.tagName.toUpperCase();
+      if (tag === 'IMG') {
+        out.push({ obj: 'image', src: deBase(n.getAttribute('src')), alt: n.getAttribute('alt') || '', title: n.getAttribute('title') || '', attrs: copyAttrs(attrs) });
+        return true;
+      }
+      var empty = !n.textContent.length && !n.querySelector('img');
+      if (empty && (READ_INLINE_TAGS[tag] || tag === 'A' || tag === 'SPAN')) return true; // zombie
+      var a2;
+      if (READ_INLINE_TAGS[tag]) { a2 = copyAttrs(attrs); a2[READ_INLINE_TAGS[tag]] = true; }
+      else if (tag === 'A') { a2 = copyAttrs(attrs); a2.link = { href: deBase(n.getAttribute('href')), title: n.getAttribute('title') || '' }; }
+      else return false; // BR, inputs, unknown structure
+      for (var c = n.firstChild; c; c = c.nextSibling) if (!readInlineNode(c, a2, out)) return false;
+      return true;
+    }
+    function readInline(container, out) {
+      for (var n = container.firstChild; n; n = n.nextSibling) if (!readInlineNode(n, {}, out)) return false;
+      return true;
+    }
+
+    function readList(listEl, depth) {
+      var ordered = listEl.tagName.toUpperCase() === 'OL';
+      var num = parseInt(listEl.getAttribute('start') || '1', 10);
+      for (var li = listEl.firstChild; li; li = li.nextSibling) {
+        if (li.nodeType === 3) { if (/^\s*$/.test(li.textContent)) continue; return false; }
+        if (li.nodeType !== 1 || li.tagName.toUpperCase() !== 'LI') return false;
+        var text = [], nested = [], seenP = false;
+        for (var n = li.firstChild; n; n = n.nextSibling) {
+          var tag = n.nodeType === 1 ? n.tagName.toUpperCase() : '';
+          if (tag === 'UL' || tag === 'OL') { nested.push(n); continue; }
+          if (nested.length) {
+            if (n.nodeType === 3 && /^\s*$/.test(n.textContent)) continue;
+            return false; // inline content after a nested list
+          }
+          if (tag === 'P') {
+            if (!n.textContent.length && !n.querySelector('img')) continue; // leftover
+            if (seenP || text.length) return false; // multi-paragraph item
+            seenP = true;
+            if (!readInline(n, text)) return false;
+            continue;
+          }
+          if (tag === 'INPUT') return false; // task list
+          if (!readInlineNode(n, {}, text)) return false;
+        }
+        blocks.push({ kind: 'listItem', depth: depth, marker: null, ordered: ordered, num: num, text: text, prov: null, raw: null, sep: null });
+        for (var q = 0; q < nested.length; q++) {
+          if (!readList(nested[q], depth + 1)) return false;
+        }
+        num++;
+      }
+      return true;
+    }
+
+    function walk(container) {
+      for (var n = container.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === 3) { if (/^\s*$/.test(n.textContent)) continue; return false; }
+        if (n.nodeType !== 1) continue;
+        var tag = n.tagName.toUpperCase();
+        var hm = tag.match(/^H([1-6])$/);
+        if (hm) {
+          var ht = [];
+          if (!readInline(n, ht)) return false;
+          blocks.push({ kind: 'heading', level: parseInt(hm[1], 10), text: ht, prov: null, raw: null, sep: null });
+        } else if (tag === 'P') {
+          if (!n.textContent.length && !n.querySelector('img')) continue; // leftover
+          var pt = [];
+          if (!readInline(n, pt)) return false;
+          blocks.push({ kind: 'paragraph', text: pt, prov: null, raw: null, sep: null });
+        } else if (tag === 'BLOCKQUOTE') {
+          var ps = [];
+          for (var c = n.firstChild; c; c = c.nextSibling) {
+            if (c.nodeType === 3) { if (!/^\s*$/.test(c.textContent)) return false; continue; }
+            if (c.nodeType !== 1) continue;
+            if (c.tagName.toUpperCase() !== 'P') return false;
+            ps.push(c);
+          }
+          if (ps.length !== 1) return false; // multi-block quote — out of model
+          var qt = [];
+          if (!readInline(ps[0], qt)) return false;
+          blocks.push({ kind: 'quote', text: qt, prov: null, raw: null, sep: null });
+        } else if (tag === 'UL' || tag === 'OL') {
+          if (!readList(n, 0)) return false;
+        } else {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    return walk(root) ? blocks : null;
+  }
+
+  // --- model diff ----------------------------------------------------------------
+
+  function markerEqM(a, b) {
+    if (!a || !b) return false;
+    if (a.bullet) return a.bullet === b.bullet;
+    return !!b.ordered && a.num === b.num && a.delim === b.delim;
+  }
+
+  // Structural agreement — text aside. A readback block's marker is null
+  // (markers aren't in the DOM) and matches anything of the right orderedness.
+  function blockStructEq(o, n) {
+    if (o.kind !== n.kind) return false;
+    if (o.kind === 'heading' && o.level !== n.level) return false;
+    if (o.kind === 'listItem') {
+      if (o.depth !== n.depth) return false;
+      if (n.marker) { if (!markerEqM(o.marker, n.marker)) return false; }
+      else if (n.ordered !== undefined && !o.marker.ordered !== !n.ordered) return false;
+    }
+    return true;
+  }
+
+  function blockMatches(o, n) {
+    return o.kind !== 'opaque' && blockStructEq(o, n) && textEqM(o.text, n.text);
+  }
+
+  // Marker for a new item: nearest sibling at the same depth (continuing its
+  // numbering), else the DOM's orderedness hint, else "-".
+  function synthMarker(nb, ctx, k, oldBlocks) {
+    if (nb.kind !== 'listItem') return null;
+    var src = null, i;
+    for (i = k - 1; i >= 0 && !src; i--) {
+      if (ctx[i] && ctx[i].kind === 'listItem' && ctx[i].depth === nb.depth) src = ctx[i].marker;
+    }
+    for (i = 0; i < oldBlocks.length && !src; i++) {
+      if (oldBlocks[i].kind === 'listItem' && oldBlocks[i].depth === nb.depth) src = oldBlocks[i].marker;
+    }
+    if (src && src.ordered && nb.ordered !== false) return { ordered: true, num: src.num + 1, delim: src.delim };
+    if (src && src.bullet && !nb.ordered) return { bullet: src.bullet };
+    return nb.ordered ? { ordered: true, num: nb.num || 1, delim: '.' } : { bullet: '-' };
+  }
+
+  /**
+   * Adopt provenance from the old parse into freshly-read blocks: blocks in
+   * the common prefix/suffix are taken wholesale (raw and all), and inside
+   * the changed region structure-matched pairs keep their inline provenance,
+   * marker, and separator so the printer can reuse original bytes.
+   */
+  function diffBlocks(oldBlocks, newBlocks) {
+    var oN = oldBlocks.length, nN = newBlocks.length;
+    var out = new Array(nN);
+    var lo = 0;
+    while (lo < oN && lo < nN && blockMatches(oldBlocks[lo], newBlocks[lo])) {
+      out[lo] = oldBlocks[lo];
+      lo++;
+    }
+    var hiO = oN, hiN = nN;
+    while (hiO > lo && hiN > lo && blockMatches(oldBlocks[hiO - 1], newBlocks[hiN - 1])) {
+      hiO--; hiN--;
+      out[hiN] = oldBlocks[hiO];
+    }
+    for (var k = lo; k < hiN; k++) {
+      var nb = newBlocks[k];
+      var ob = (lo + (k - lo) < hiO) ? oldBlocks[lo + (k - lo)] : null;
+      var adopted = {
+        kind: nb.kind, level: nb.level, depth: nb.depth,
+        marker: null, text: nb.text, prov: null, raw: null, sep: '\n',
+      };
+      if (ob && blockStructEq(ob, nb)) {
+        adopted.prov = ob.prov;
+        adopted.sep = ob.sep != null ? ob.sep : '\n';
+        adopted.marker = nb.marker || ob.marker;
+      } else {
+        adopted.marker = nb.marker || synthMarker(nb, out, k, oldBlocks);
+        if (k === nN - 1 && oN && oldBlocks[oN - 1].sep != null) adopted.sep = oldBlocks[oN - 1].sep;
+      }
+      out[k] = adopted;
+    }
+    return out;
+  }
 
   // --- Bold / italic toggle ------------------------------------------------
 
@@ -1081,36 +1497,6 @@
   // folded into the source or be reported as impossible; it must never sit
   // silently in the DOM to be resurrected by the next re-render.
 
-  // Raw + display spans for every composite inline/item token, outer-first.
-  // A composite's display span is the union of its descendant leaves; its raw
-  // span is located by searching for token.raw at/before the first leaf (the
-  // delimiters/markers precede it). Nested-list raws are deindented by marked
-  // and may not be locatable — those composites are skipped (the relex
-  // verification backstop covers anything missed).
-  function compositeSpans(blockToken, leaves) {
-    var out = [], li = { i: 0 };
-    (function walk(token, isRoot) {
-      var kids = token.type === 'image' ? null : childrenOf(token);
-      if (!kids) {
-        var L = leaves[li.i++];
-        return { ds: L.dispStart, de: L.dispEnd, rs: L.rawStart, re: L.rawEnd };
-      }
-      var ds = Infinity, de = -Infinity, rs = Infinity, re = -Infinity;
-      for (var k = 0; k < kids.length; k++) {
-        var sp = walk(kids[k], false);
-        ds = Math.min(ds, sp.ds); de = Math.max(de, sp.de);
-        rs = Math.min(rs, sp.rs); re = Math.max(re, sp.re);
-      }
-      if (!isRoot && isFinite(rs)) {
-        var idx = blockToken.raw.lastIndexOf(token.raw, rs);
-        if (idx >= 0 && idx + token.raw.length >= re) { rs = idx; re = idx + token.raw.length; }
-        out.push({ token: token, ds: ds, de: de, rs: rs, re: re });
-      }
-      return { ds: ds, de: de, rs: rs, re: re };
-    })(blockToken, true);
-    return out;
-  }
-
   // What `md` actually renders to, through the same pipeline the editor uses
   // for its blocks (marked.parse + structural-whitespace strip). The lexer's
   // token text is NOT a safe proxy: e.g. a paragraph's leading space survives
@@ -1200,146 +1586,48 @@
    *         { changed:true, raw, empty } when reconciled (empty: the block's
    *         visible text is now gone — caller may drop/convert the block), or
    *         null when the DOM state can't be mapped to source (caller reverts).
+   *
+   * The write path is the model: parse the block, read the DOM back into the
+   * same space, adopt provenance for everything the edit didn't touch, print.
+   * No candidate enumeration — in (ch, attrs) space the boundary ambiguities
+   * that needed it don't exist. The old acceptance check stays as the last
+   * line of defense: a reconciled source must re-lex as one block rendering
+   * exactly the DOM's text and canonical structure, or the edit is refused.
    */
   function reconcileDomEdit(el, blockToken, marked, base) {
+    var doc = el.ownerDocument;
     var leaves = leafMap(blockToken);
     var oldDisp = leaves.map(function (L) { return dispShownOf(L.token); }).join('');
     var newDisp = (el.textContent || '').replace(/\n+$/, '');
-    var raw = blockToken.raw;
-    var minLen = Math.min(oldDisp.length, newDisp.length);
-    var p = 0;
-    while (p < minLen && oldDisp[p] === newDisp[p]) p++;
-    var s = 0;
-    while (s < minLen - p && oldDisp[oldDisp.length - 1 - s] === newDisp[newDisp.length - 1 - s]) s++;
-    var oldEnd = oldDisp.length - s;
-    var newSub = newDisp.slice(p, newDisp.length - s);
-    var composites = compositeSpans(blockToken, leaves);
-
-    // Edit edge display→source, as a list of legal placements. Strictly
-    // inside a leaf there is one (text leaves map by offset; opaque leaves —
-    // codespan, escape — map through their display text's position inside
-    // their raw). At a leaf boundary the display offset is ambiguous: just
-    // inside the leaf that ends there (before its closing delimiter), just
-    // after it, or at the start of the next leaf. Which one the user meant is
-    // decided by trying each and accepting the candidate whose rendering
-    // matches the DOM's formatting fingerprint, not just its text.
-    function srcCandidatesAt(disp) {
-      var endsHere = null, startsHere = null;
-      for (var i = 0; i < leaves.length; i++) {
-        var L = leaves[i];
-        if (L.dispStart === L.dispEnd) continue;
-        if (disp > L.dispStart && disp < L.dispEnd) {
-          if (L.type === 'text') return [L.rawStart + (disp - L.dispStart)];
-          var inner = L.token.raw.indexOf(dispTextOf(L.token));
-          return inner >= 0 ? [L.rawStart + inner + (disp - L.dispStart)] : [];
-        }
-        if (L.dispEnd === disp) endsHere = L;
-        if (L.dispStart === disp && !startsHere) startsHere = L;
-      }
-      var out = [];
-      if (endsHere) {
-        out.push(endsHere.rawEnd);
-        if (endsHere.type !== 'text') {
-          var inn = endsHere.token.raw.indexOf(dispTextOf(endsHere.token));
-          if (inn >= 0) out.push(endsHere.rawStart + inn + dispTextOf(endsHere.token).length);
-        }
-      }
-      if (startsHere && out.indexOf(startsHere.rawStart) < 0) out.push(startsHere.rawStart);
-      if (!out.length && leaves.length) out.push(leaves[0].rawStart);
-      return out;
-    }
-
     var domCanon = canonicalOfEl(el, base);
+    if (newDisp === oldDisp &&
+        renderedCanonicalOf(doc, blockToken.raw, marked) === domCanon) {
+      return { changed: false };
+    }
     function accept(cand) {
-      var tok = relexMatches(el.ownerDocument, cand, newDisp, marked);
+      if (cand === blockToken.raw) return { changed: false };
+      var tok = relexMatches(doc, cand, newDisp, marked);
       if (tok === null) return null;
-      if (renderedCanonicalOf(el.ownerDocument, cand, marked) !== domCanon) return null;
+      if (renderedCanonicalOf(doc, cand, marked) !== domCanon) return null;
       return { changed: true, raw: cand, empty: newDisp === '' };
     }
-
-    if (newDisp === oldDisp) {
-      if (renderedCanonicalOf(el.ownerDocument, raw, marked) === domCanon) return { changed: false };
-      // Text-identical but structurally different: only zero-display-width
-      // content (images) can change without moving a character. Match the
-      // DOM's images against the source's in order; unmatched source images
-      // were deleted — splice their raws out.
-      var domImgs = [], imgs = el.querySelectorAll('img');
-      for (var di = 0; di < imgs.length; di++) {
-        var sv = imgs[di].getAttribute('src') || '';
-        if (base && sv.indexOf(base) === 0) sv = sv.slice(base.length);
-        domImgs.push(sv + '|' + (imgs[di].getAttribute('alt') || ''));
-      }
-      var gone = [], dp = 0;
-      for (var ig = 0; ig < leaves.length; ig++) {
-        var IL = leaves[ig];
-        if (IL.token.type !== 'image') continue;
-        var sig = (IL.token.href || '') + '|' + (IL.token.text || '');
-        if (dp < domImgs.length && domImgs[dp] === sig) { dp++; continue; }
-        gone.push(IL);
-      }
-      if (!gone.length || dp !== domImgs.length) return null;
-      var out0 = raw;
-      for (var gi = gone.length - 1; gi >= 0; gi--) out0 = out0.slice(0, gone[gi].rawStart) + out0.slice(gone[gi].rawEnd);
-      return accept(out0);
-    }
-    // Typed text containing markdown specials (*, `, [, …) must reach the
-    // source escaped, or it stops being literal there.
-    function escaped(text) { return text.replace(/([\\`*_~\[\]])/g, '\\$1'); }
-
-    // Candidate 1: splice the source between the mapped edges, widened over
-    // any composite (emphasis run, link, list item) whose entire display text
-    // fell inside the deletion — its delimiters/marker must go too. Each
-    // legal edge placement is tried until one renders to the DOM's exact
-    // text + formatting.
-    var aList = srcCandidatesAt(p), bList = srcCandidatesAt(oldEnd);
-    for (var ai = 0; ai < aList.length; ai++) {
-      for (var bi = 0; bi < bList.length; bi++) {
-        var a = aList[ai], b = bList[bi];
-        if (a > b) continue;
-        for (var c = 0; c < composites.length; c++) {
-          var C = composites[c];
-          if (C.ds < C.de && C.ds >= p && C.de <= oldEnd) {
-            a = Math.min(a, C.rs); b = Math.max(b, C.re);
-          }
-        }
-        var r1 = accept(raw.slice(0, a) + newSub + raw.slice(b));
-        if (!r1 && newSub) r1 = accept(raw.slice(0, a) + escaped(newSub) + raw.slice(b));
-        if (r1) return r1;
-      }
-    }
-
-    // Candidate 2: distribute the edit per-leaf (a partially-deleted emphasis
-    // run keeps its delimiters around the surviving text), deleting fully-
-    // covered composites whole. Handles edits candidate 1 garbles, e.g. a
-    // deletion running from inside a bold run into the text after it.
-    var ops = [];
-    for (var j = 0; j < leaves.length; j++) {
-      var L2 = leaves[j];
-      if (L2.dispStart === L2.dispEnd || L2.dispEnd <= p || L2.dispStart >= oldEnd) continue;
-      var from = Math.max(p, L2.dispStart), to = Math.min(oldEnd, L2.dispEnd);
-      var full = from === L2.dispStart && to === L2.dispEnd;
-      if (!full && L2.type !== 'text') return null;
-      ops.push({ start: full ? L2.rawStart : L2.rawStart + (from - L2.dispStart),
-                 end: full ? L2.rawEnd : L2.rawStart + (to - L2.dispStart) });
-    }
-    if (!ops.length) return null;
-    for (var c2 = 0; c2 < composites.length; c2++) {
-      var C2 = composites[c2];
-      if (!(C2.ds < C2.de && C2.ds >= p && C2.de <= oldEnd)) continue;
-      ops = ops.filter(function (o) { return o.start < C2.rs || o.end > C2.re; });
-      ops.push({ start: C2.rs, end: C2.re });
-    }
-    ops.sort(function (x, y) { return x.start - y.start; });
-    var merged = [];
-    for (var m = 0; m < ops.length; m++) {
-      var last = merged[merged.length - 1];
-      if (last && ops[m].start <= last.end) last.end = Math.max(last.end, ops[m].end);
-      else merged.push({ start: ops[m].start, end: ops[m].end });
-    }
-    var insertAt = merged[0].start, out = raw;
-    for (var q = merged.length - 1; q >= 0; q--) out = out.slice(0, merged[q].start) + out.slice(merged[q].end);
-    return accept(out.slice(0, insertAt) + newSub + out.slice(insertAt))
-        || (newSub ? accept(out.slice(0, insertAt) + escaped(newSub) + out.slice(insertAt)) : null);
+    var oldBlocks = parseBlocks(blockToken.raw, marked);
+    if (!oldBlocks) return null; // block outside the model — refuse, don't guess
+    var newBlocks = readBlocksFromDom(el, base);
+    if (!newBlocks) return null; // DOM structure outside the model
+    var adopted = diffBlocks(oldBlocks, newBlocks);
+    var cand = printBlocks(adopted, marked);
+    var r = accept(cand);
+    if (r) return r;
+    // Adopted provenance can go stale against a heavily-rearranged DOM;
+    // retry once with a fully canonical print before refusing.
+    var canonical = printBlocks(adopted.map(function (b) {
+      return b.kind === 'opaque' ? b : {
+        kind: b.kind, level: b.level, depth: b.depth, marker: b.marker,
+        text: b.text, prov: null, raw: null, sep: b.sep,
+      };
+    }), marked);
+    return canonical === cand ? null : accept(canonical);
   }
 
   return {
@@ -1374,6 +1662,12 @@
       attrsEq: attrsEqM,
       charEq: charEqM,
       textEq: textEqM,
+      parseBlocks: parseBlocks,
+      parseDoc: parseDoc,
+      printBlocks: printBlocks,
+      printDoc: printDoc,
+      readBlocksFromDom: readBlocksFromDom,
+      diffBlocks: diffBlocks,
     },
   };
 });

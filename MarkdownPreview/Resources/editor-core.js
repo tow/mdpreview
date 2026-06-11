@@ -791,13 +791,32 @@
     return scratch.textContent.replace(/\n+$/, '');
   }
 
-  // Non-empty inline formatting elements with their text — the formatting
-  // fingerprint that must converge between DOM and source. Empty elements are
-  // excluded: a zombie <em> left behind by a deletion renders as nothing.
+  // The structure fingerprint that must converge between DOM and source:
+  // non-empty inline formatting elements with their text, plus list items
+  // with their kind, nesting depth, and direct text. Text equality alone is
+  // blind to "the char went into the wrong item" and "source has three items,
+  // the DOM merged them into one". Empty elements are excluded on both
+  // counts: a zombie <em> renders as nothing, and the browser's leftover
+  // empty <li>s after a big deletion can't be matched to source bullets
+  // one-for-one (requiring that would make whole-list deletion
+  // unreconcilable, which is far worse than a transient ghost bullet).
   function skeletonOfEl(el) {
     var out = [], list = el.querySelectorAll('strong,em,a,code,del');
     for (var i = 0; i < list.length; i++) {
       if (list[i].textContent.length) out.push(list[i].tagName.toUpperCase() + ':' + list[i].textContent);
+    }
+    var items = el.querySelectorAll('li');
+    for (var j = 0; j < items.length; j++) {
+      var li = items[j], depth = 0;
+      for (var q = li.parentNode; q && q !== el; q = q.parentNode) {
+        var tg = (q.tagName || '').toUpperCase();
+        if (tg === 'UL' || tg === 'OL') depth++;
+      }
+      var kind = (li.parentNode && (li.parentNode.tagName || '').toUpperCase() === 'OL') ? 'OL' : 'UL';
+      var clone = li.cloneNode(true);
+      var subs = clone.querySelectorAll('ul,ol');
+      for (var s = 0; s < subs.length; s++) subs[s].parentNode.removeChild(subs[s]);
+      if (clone.textContent.length) out.push(kind + depth + ':' + clone.textContent);
     }
     return out.join('|');
   }

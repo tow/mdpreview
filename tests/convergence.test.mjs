@@ -51,13 +51,16 @@ function genInline(rnd) {
   return bits.join(' ');
 }
 function genBlock(rnd) {
-  switch (irange(rnd, 1, 4)) {
+  switch (irange(rnd, 1, 5)) {
     case 1: return '#'.repeat(irange(rnd, 1, 3)) + ' ' + genInline(rnd);
-    case 2: case 3: return genInline(rnd);
-    case 4: {
+    case 2: return genInline(rnd);
+    default: {
+      const ordered = rnd() < 0.3;
       const items = [];
-      for (let i = 0, n = irange(rnd, 2, 4); i < n; i++) {
-        items.push((rnd() < 0.25 && i > 0 ? '  - ' : '- ') + genInline(rnd));
+      for (let i = 0, n = irange(rnd, 2, 5); i < n; i++) {
+        const marker = ordered ? `${i + 1}. ` : '- ';
+        const nest = rnd() < 0.3 && i > 0 ? '  ' : '';
+        items.push(nest + (nest && ordered ? '1. ' : nest ? '- ' : marker) + genInline(rnd));
       }
       return items.join('\n');
     }
@@ -234,12 +237,9 @@ function domDisplay(t) {
 // Formatting must converge too, not just text: a deletion can leave a zombie
 // <em>/<strong> in the DOM that the source no longer has, silently formatting
 // whatever is typed into it (and making Cmd+I act on the wrong model).
-const SKEL_TAGS = 'strong,em,a,code,del';
-function skeleton(root) {
-  return Array.from(root.querySelectorAll(SKEL_TAGS))
-    .filter((n) => n.textContent.length) // empty zombies render as nothing
-    .map((n) => n.tagName + ':' + n.textContent).join('|');
-}
+// The structural fingerprint is the core's own — the fuzzer must judge with
+// the same eyes the editor verifies with, or the two drift apart.
+function skeleton(root) { return core.skeletonOfEl(root); }
 function sourceSkeleton(t) {
   const parts = [];
   for (const seg of t.win._segments) {

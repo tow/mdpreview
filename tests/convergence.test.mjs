@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { core, marked } from './_setup.mjs';
+import { mulberry32, pick, irange, genDoc } from './_prop.mjs';
 
 // THE editor invariant, fuzzed.
 //
@@ -28,51 +29,9 @@ const scriptSrc = (templateHtml.match(/<script>([\s\S]*?)<\/script>/g) || [])
   .map((b) => b.replace(/^<script>/, '').replace(/<\/script>$/, ''))
   .find((s) => s.includes('marked.use'));
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const pick = (rnd, arr) => arr[Math.floor(rnd() * arr.length)];
-const irange = (rnd, lo, hi) => lo + Math.floor(rnd() * (hi - lo + 1));
-
-// --- random documents -------------------------------------------------------
-function genInline(rnd) {
-  const words = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'fox'];
-  const bits = [];
-  for (let i = 0, n = irange(rnd, 1, 4); i < n; i++) {
-    const w = pick(rnd, words);
-    bits.push(pick(rnd, [w, w, w, `**${w}**`, `*${w}*`, '`' + w + '`',
-      `[${w}](https://x.test/${w})`, `![${w}](${w}.png)`]));
-  }
-  return bits.join(' ');
-}
-function genBlock(rnd) {
-  switch (irange(rnd, 1, 6)) {
-    case 1: return '#'.repeat(irange(rnd, 1, 3)) + ' ' + genInline(rnd);
-    case 2: return genInline(rnd);
-    case 6: return '> ' + genInline(rnd);
-    default: {
-      const ordered = rnd() < 0.3;
-      const items = [];
-      for (let i = 0, n = irange(rnd, 2, 5); i < n; i++) {
-        const marker = ordered ? `${i + 1}. ` : '- ';
-        const nest = rnd() < 0.3 && i > 0 ? '  ' : '';
-        items.push(nest + (nest && ordered ? '1. ' : nest ? '- ' : marker) + genInline(rnd));
-      }
-      return items.join('\n');
-    }
-  }
-}
-function genDoc(rnd) {
-  const blocks = [];
-  for (let i = 0, n = irange(rnd, 2, 4); i < n; i++) blocks.push(genBlock(rnd));
-  return blocks.join('\n\n') + '\n';
-}
+// Random documents and the seeded RNG live in _prop.mjs (shared with the
+// model-law suites); the default generator paths there are byte-identical to
+// what this file used to define, so seeds reproduce the same documents.
 
 // --- page under test --------------------------------------------------------
 async function setup(md) {

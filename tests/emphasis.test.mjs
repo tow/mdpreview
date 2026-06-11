@@ -90,3 +90,36 @@ test('strong inside an italic word nests (***)', () => {
   const r = core.toggleEmphasis(s, start, start + 5, 'strong', marked);
   assert.equal(r.md, 'hello ***world***');
 });
+
+test('un-italicizing a word in the middle of an italic run splits the run', () => {
+  const s = 'x *one two three* y';
+  const start = at(s, 'two');
+  const r = core.toggleEmphasis(s, start, start + 3, 'em', marked);
+  assert.equal(r.md, 'x *one* two *three* y');
+  assert.equal(r.md.slice(r.selStart, r.selEnd), 'two');
+});
+
+test('un-italicizing the leading words of a run keeps the tail italic', () => {
+  const s = 'x *one two three* y';
+  const start = at(s, 'one');
+  const r = core.toggleEmphasis(s, start, start + 'one two'.length, 'em', marked);
+  assert.equal(r.md, 'x one two *three* y');
+});
+
+test('un-bolding a middle word splits the bold run', () => {
+  const s = '**one two three**';
+  const start = at(s, 'two');
+  const r = core.toggleEmphasis(s, start, start + 3, 'strong', marked);
+  assert.equal(r.md, '**one** two **three**');
+});
+
+test('toggling the middle word twice restores an equivalent run', () => {
+  const s = 'x *one two three* y';
+  const start = at(s, 'two');
+  const r1 = core.toggleEmphasis(s, start, start + 3, 'em', marked);
+  const r2 = core.toggleEmphasis(r1.md, r1.selStart, r1.selEnd, 'em', marked);
+  // same visible text, and "two" is italic again (adjacent runs are not
+  // merged back into one — the inter-word spaces stay plain, imperceptibly)
+  assert.equal(core.displayTextOf(r2.md, marked), core.displayTextOf(s, marked));
+  assert.match(r2.md, /\*two\*/);
+});

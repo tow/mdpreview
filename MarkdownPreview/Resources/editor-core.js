@@ -179,6 +179,19 @@
         end - start >= 2 * dl && s.slice(start, start + dl) === d && s.slice(end - dl, end) === d) {
       return { md: s.slice(0, start) + s.slice(start + dl, end - dl) + s.slice(end), selStart: start, selEnd: end - 2 * dl };
     }
+    // Split: the selection sits strictly inside a same-kind run — un-toggling
+    // a middle word. Close the run before the selection and reopen after it
+    // (*one two three* → *one* two *three*), keeping whitespace outside the
+    // new delimiters (a closing * preceded by a space doesn't lex).
+    var run = emphasisRunAt(s, start, end, kind, marked);
+    if (run) {
+      var before = s.slice(run.rs + dl, start), mid = s.slice(start, end), after = s.slice(end, run.re - dl);
+      var bCore = before.replace(/\s+$/, ''), bWS = before.slice(bCore.length);
+      var aWS = (after.match(/^\s*/) || [''])[0], aCore = after.slice(aWS.length);
+      var repl = (bCore ? d + bCore + d : '') + bWS + mid + aWS + (aCore ? d + aCore + d : '');
+      var selStart = run.rs + (bCore ? bCore.length + 2 * dl : 0) + bWS.length;
+      return { md: s.slice(0, run.rs) + repl + s.slice(run.re), selStart: selStart, selEnd: selStart + mid.length };
+    }
     // Wrap: strip same-kind wrappers inside the selection, then wrap once.
     var stripped = stripSameKind(s.slice(start, end), kind, marked);
     var md = s.slice(0, start) + d + stripped + d + s.slice(end);
@@ -187,6 +200,27 @@
     var absorbed = s.slice(start - L, start) + d + stripped + d + s.slice(end, end + R);
     if (!hasTokenRaw(md, d + stripped + d, kind, marked) && !hasTokenRaw(md, absorbed, kind, marked)) return null;
     return { md: md, selStart: start + dl, selEnd: start + dl + stripped.length };
+  }
+
+  // The innermost `kind` emphasis run whose content strictly contains
+  // [start,end) — the case where toggling means splitting the run, not
+  // wrapping or unwrapping. Returns { rs, re } raw span or null.
+  function emphasisRunAt(s, start, end, kind, marked) {
+    var toks;
+    try { toks = marked.lexer(s); } catch (_) { return null; }
+    if (toks.length === 0) return null;
+    var block = toks[0], dl = delimFor(kind).length;
+    var comps;
+    try { comps = compositeSpans(block, leafMap(block)); } catch (_) { return null; }
+    var best = null;
+    for (var i = 0; i < comps.length; i++) {
+      var c = comps[i];
+      if (c.token.type !== kind) continue;
+      if (start >= c.rs + dl && end <= c.re - dl && (start > c.rs + dl || end < c.re - dl)) {
+        if (!best || c.rs >= best.rs) best = c;
+      }
+    }
+    return best;
   }
 
   // --- Enter split / Backspace merge ---------------------------------------

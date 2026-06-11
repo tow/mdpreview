@@ -121,106 +121,396 @@
     return raw;
   }
 
+  // --- StyledDoc model — inline layer ----------------------------------------
+  //
+  // Styled text is an array of chars: { ch, attrs } for one display code
+  // point, { obj:'image', src, alt, title, attrs } for an atomic object.
+  // attrs is { b, i, code, del, link:{href,title} }. Operations are functions
+  // on this space and therefore are their own specs — no delimiters exist
+  // here. parseInline lifts an inline markdown fragment into the model (null
+  // = refused, out of model scope); printInline lowers styled text back,
+  // reusing original bytes for provenance spans whose chars are untouched —
+  // that is how `_em_`, `\*` escapes and `&amp;` entities survive edits
+  // elsewhere in the same fragment.
+
+  var ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+  // Decode HTML entities to display chars; null when an entity is outside the
+  // supported set (the fragment is then refused — never guess display text).
+  function decodeEntities(s) {
+    var bad = false;
+    var out = s.replace(/&(#\d+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, function (m, body) {
+      if (body.charAt(0) === '#') {
+        var code = (body.charAt(1) === 'x' || body.charAt(1) === 'X')
+          ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+        if (!isFinite(code) || code <= 0) { bad = true; return m; }
+        return String.fromCodePoint(code);
+      }
+      if (ENTITIES.hasOwnProperty(body)) return ENTITIES[body];
+      bad = true;
+      return m;
+    });
+    return bad ? null : out;
+  }
+
+  function copyAttrs(attrs) {
+    var out = {};
+    if (attrs) {
+      if (attrs.b) out.b = true;
+      if (attrs.i) out.i = true;
+      if (attrs.code) out.code = true;
+      if (attrs.del) out.del = true;
+      if (attrs.link) out.link = attrs.link; // shared by reference within a run
+    }
+    return out;
+  }
+
+  function copyChar(c) {
+    return c.obj
+      ? { obj: c.obj, src: c.src, alt: c.alt, title: c.title || '', attrs: copyAttrs(c.attrs) }
+      : { ch: c.ch, attrs: copyAttrs(c.attrs) };
+  }
+
+  function attrsEqM(a, b) {
+    a = a || {}; b = b || {};
+    if (!a.b !== !b.b || !a.i !== !b.i || !a.code !== !b.code || !a.del !== !b.del) return false;
+    var la = a.link || null, lb = b.link || null;
+    if (!la !== !lb) return false;
+    if (la && (la.href !== lb.href || (la.title || '') !== (lb.title || ''))) return false;
+    return true;
+  }
+
+  function charEqM(x, y) {
+    if (!x.obj !== !y.obj) return false;
+    if (x.obj) {
+      if (x.obj !== y.obj || x.src !== y.src || x.alt !== y.alt ||
+          (x.title || '') !== (y.title || '')) return false;
+    } else if (x.ch !== y.ch) return false;
+    return attrsEqM(x.attrs, y.attrs);
+  }
+
+  function textEqM(x, y) {
+    if (x.length !== y.length) return false;
+    for (var i = 0; i < x.length; i++) if (!charEqM(x[i], y[i])) return false;
+    return true;
+  }
+
+  function isWsChar(c) { return !c.obj && /^\s$/.test(c.ch); }
+
+  /**
+   * Parse an inline markdown fragment into styled text.
+   * Returns { text:[Char], prov:[{from,to,raw,chars}] } — one provenance span
+   * per top-level inline token (their raws tile the fragment) — or null when
+   * the fragment contains a construct outside the model (raw html, hard
+   * breaks, unknown entities). Refused fragments stay byte-opaque upstream.
+   */
+  function parseInline(frag, marked) {
+    var toks;
+    try { toks = marked.Lexer.lexInline(frag); } catch (_) { return null; }
+    var joined = '';
+    for (var i = 0; i < toks.length; i++) joined += toks[i].raw;
+    if (joined !== frag) return null; // positions unknowable — out of scope
+    var text = [];
+    function emit(t, attrs) {
+      var k, a;
+      switch (t.type) {
+        case 'text': {
+          if (t.tokens && t.tokens.length) return emitList(t.tokens, attrs);
+          var dec = decodeEntities(t.text);
+          if (dec === null) return false;
+          for (k = 0; k < dec.length; k++) text.push({ ch: dec.charAt(k), attrs: copyAttrs(attrs) });
+          return true;
+        }
+        case 'escape':
+          for (k = 0; k < t.text.length; k++) text.push({ ch: t.text.charAt(k), attrs: copyAttrs(attrs) });
+          return true;
+        case 'codespan':
+          a = copyAttrs(attrs); a.code = true;
+          for (k = 0; k < t.text.length; k++) text.push({ ch: t.text.charAt(k), attrs: copyAttrs(a) });
+          return true;
+        case 'strong': a = copyAttrs(attrs); a.b = true; return emitList(t.tokens, a);
+        case 'em': a = copyAttrs(attrs); a.i = true; return emitList(t.tokens, a);
+        case 'del': a = copyAttrs(attrs); a.del = true; return emitList(t.tokens, a);
+        case 'link':
+          a = copyAttrs(attrs); a.link = { href: t.href, title: t.title || '' };
+          return emitList(t.tokens, a);
+        case 'image':
+          text.push({ obj: 'image', src: t.href, alt: t.text, title: t.title || '', attrs: copyAttrs(attrs) });
+          return true;
+        default:
+          return false; // br, html, anything new marked grows — refused
+      }
+    }
+    function emitList(list, attrs) {
+      for (var j = 0; j < list.length; j++) if (!emit(list[j], attrs)) return false;
+      return true;
+    }
+    var prov = [];
+    for (var n = 0; n < toks.length; n++) {
+      var from = text.length;
+      if (!emit(toks[n], {})) return null;
+      prov.push({ from: from, to: text.length, raw: toks[n].raw, chars: text.slice(from).map(copyChar) });
+    }
+    return { text: text, prov: prov };
+  }
+
+  /**
+   * Normalize styled text to the printable subset: emphasis-family attrs
+   * (b/i/del) can't sit on run-boundary whitespace (the delimiters wouldn't
+   * lex) and can't survive inside code. Display chars are never changed.
+   */
+  function canonText(text) {
+    var out = text.map(copyChar), i;
+    for (i = 0; i < out.length; i++) {
+      if (out[i].attrs.code || out[i].obj) {
+        if (out[i].obj) { delete out[i].attrs.code; }
+        if (out[i].attrs.code) { delete out[i].attrs.b; delete out[i].attrs.i; delete out[i].attrs.del; }
+      }
+    }
+    var KEYS = ['b', 'i', 'del'];
+    for (var k = 0; k < KEYS.length; k++) {
+      var key = KEYS[k];
+      i = 0;
+      while (i < out.length) {
+        if (!out[i].attrs[key]) { i++; continue; }
+        var j = i;
+        while (j < out.length && out[j].attrs[key]) j++;
+        var p = i;
+        while (p < j && isWsChar(out[p])) { delete out[p].attrs[key]; p++; }
+        var q = j - 1;
+        while (q >= p && isWsChar(out[q])) { delete out[q].attrs[key]; q--; }
+        i = j;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The model op behind Cmd+B/Cmd+I: if every non-whitespace char in
+   * [start,end) already carries `attr`, remove it from the range; otherwise
+   * set it on the whole range (interior whitespace included — canonText hoists
+   * it back off the boundaries). Returns the input array itself when the range
+   * has nothing togglable, so callers can detect the refusal.
+   */
+  function toggleAttr(text, start, end, attr) {
+    start = Math.max(0, start); end = Math.min(text.length, end);
+    var any = false, allSet = true, i;
+    for (i = start; i < end; i++) {
+      if (isWsChar(text[i])) continue;
+      any = true;
+      if (!text[i].attrs[attr]) allSet = false;
+    }
+    if (!any) return text;
+    var out = text.map(copyChar);
+    for (i = start; i < end; i++) {
+      if (allSet) delete out[i].attrs[attr];
+      else out[i].attrs[attr] = true;
+    }
+    return out;
+  }
+
+  // --- the printer -----------------------------------------------------------
+
+  // Outermost-first delimiter order; code is innermost and exclusive of b/i/del
+  // (canonText guarantees that), link compared by reference so two adjacent
+  // distinct links to the same href stay two links.
+  var PRINT_PRIO = ['link', 'b', 'i', 'del', 'code'];
+  var ESCAPABLE = /[\\`*_~\[\]&<]/;
+
+  function attrValOf(c, key) { return key === 'link' ? (c.attrs.link || null) : !!c.attrs[key]; }
+
+  function emitCharCanon(c, k, B) {
+    B.pos[k] = B.s.length;
+    if (c.obj) B.s += '![' + (c.alt || '') + '](' + c.src + (c.title ? ' "' + c.title + '"' : '') + ')';
+    else B.s += ESCAPABLE.test(c.ch) ? '\\' + c.ch : c.ch;
+    B.end[k] = B.s.length;
+  }
+
+  // A codespan whose content contains backticks needs a longer fence; content
+  // with a boundary space/backtick needs the one-space padding CommonMark
+  // strips back off.
+  function emitCodeCanon(text, i, j, B) {
+    var content = '', k;
+    for (k = i; k < j; k++) content += text[k].ch;
+    var runs = content.match(/`+/g), longest = 0;
+    if (runs) for (k = 0; k < runs.length; k++) longest = Math.max(longest, runs[k].length);
+    var fence = new Array(longest + 2).join('`');
+    var pad = (content === '' || /^[ `]|[ `]$/.test(content)) ? ' ' : '';
+    B.s += fence + pad;
+    for (k = i; k < j; k++) { B.pos[k] = B.s.length; B.s += text[k].ch; B.end[k] = B.s.length; }
+    B.s += pad + fence;
+  }
+
+  function printCanonInto(text, a, b, d, B) {
+    if (a >= b) return;
+    if (d >= PRINT_PRIO.length) {
+      for (var k = a; k < b; k++) emitCharCanon(text[k], k, B);
+      return;
+    }
+    var key = PRINT_PRIO[d], i = a;
+    while (i < b) {
+      var hv = attrValOf(text[i], key), j = i + 1;
+      while (j < b && attrValOf(text[j], key) === hv) j++;
+      if (!hv) printCanonInto(text, i, j, d + 1, B);
+      else if (key === 'link') {
+        B.s += '[';
+        printCanonInto(text, i, j, d + 1, B);
+        B.s += '](' + hv.href + (hv.title ? ' "' + hv.title + '"' : '') + ')';
+      } else if (key === 'code') {
+        emitCodeCanon(text, i, j, B);
+      } else {
+        var dlm = key === 'b' ? '**' : key === 'i' ? '*' : '~~';
+        B.s += dlm;
+        printCanonInto(text, i, j, d + 1, B);
+        B.s += dlm;
+      }
+      i = j;
+    }
+  }
+
+  // Leading delimiter width of a provenance span's raw — how far into the raw
+  // its first display char sits. Used for approximate char→byte positions in
+  // reused spans and for snapping source offsets to char indices.
+  function provLeadLen(raw) {
+    var m = raw.match(/^(\*+|_+|~+)/);
+    if (m) return m[1].length;
+    m = raw.match(/^`+ ?/);
+    if (m) return m[0].length;
+    if (raw.charAt(0) === '\\') return 1;
+    if (raw.slice(0, 2) === '![') return 0;
+    if (raw.charAt(0) === '[') return 1;
+    return 0;
+  }
+
+  function matchChunk(text, at, chars) {
+    if (at < 0 || at + chars.length > text.length) return false;
+    for (var k = 0; k < chars.length; k++) if (!charEqM(text[at + k], chars[k])) return false;
+    return true;
+  }
+
+  function emitProvSpan(sp, atIdx, B) {
+    var base = B.s.length, lead = provLeadLen(sp.raw), n = sp.to - sp.from;
+    for (var k = 0; k < n; k++) {
+      B.pos[atIdx + k] = Math.min(base + lead + k, base + sp.raw.length);
+      B.end[atIdx + k] = Math.min(B.pos[atIdx + k] + 1, base + sp.raw.length);
+    }
+    B.s += sp.raw;
+  }
+
+  /**
+   * Print styled text to markdown. With prov (and marked), original bytes are
+   * reused for the longest prefix and suffix of provenance spans whose chars
+   * are untouched; the changed middle is printed canonically, and the result
+   * is verified by reparse — any disagreement falls back to a full canonical
+   * print, which is always representable. Returns { s, pos, end } where
+   * pos[k]/end[k] bracket char k's bytes in s.
+   */
+  function printInlineParts(text, prov, marked) {
+    var B = { s: '', pos: new Array(text.length), end: new Array(text.length) };
+    if (!prov || !prov.length || !marked) {
+      printCanonInto(text, 0, text.length, 0, B);
+      return B;
+    }
+    var i = 0, pi = 0;
+    while (pi < prov.length && matchChunk(text, i, prov[pi].chars)) {
+      i += prov[pi].chars.length; pi++;
+    }
+    var j = text.length, sj = prov.length, tail = [];
+    while (sj > pi) {
+      var sp = prov[sj - 1], L = sp.chars.length;
+      if (j - L >= i && matchChunk(text, j - L, sp.chars)) { tail.unshift(sp); sj--; j -= L; }
+      else break;
+    }
+    var at = 0, h;
+    for (h = 0; h < pi; h++) { emitProvSpan(prov[h], at, B); at += prov[h].chars.length; }
+    printCanonInto(text, i, j, 0, B);
+    at = j;
+    for (h = 0; h < tail.length; h++) { emitProvSpan(tail[h], at, B); at += tail[h].chars.length; }
+    var reparsed = parseInline(B.s, marked);
+    if (!reparsed || !textEqM(reparsed.text, canonText(text))) {
+      B = { s: '', pos: new Array(text.length), end: new Array(text.length) };
+      printCanonInto(text, 0, text.length, 0, B);
+    }
+    return B;
+  }
+
+  function printInline(text, prov, marked) { return printInlineParts(text, prov, marked).s; }
+
   // --- Bold / italic toggle ------------------------------------------------
 
-  function delimFor(kind) { return kind === 'strong' ? '**' : '*'; }
+  // Inline content span [fs, fe) of the line/block the selection sits in,
+  // plus the block's lexed type. Paragraph content is the whole block
+  // (emphasis may span soft breaks); everything else is line-scoped, with
+  // quote/list/heading markers excluded via the prefix match.
+  var LINE_PREFIX = /^(\s*(?:>[ \t]?|[-*+][ \t]+|\d+[.)][ \t]+)*)(#{1,6}[ \t]+)?/;
+  function inlineFragSpanAt(s, start, end, marked) {
+    var tok;
+    try { tok = marked.lexer(s)[0]; } catch (_) { return null; }
+    if (!tok) return null;
+    if (tok.type === 'paragraph') {
+      var fe = s.replace(/\n+$/, '').length;
+      return start >= 0 && end <= fe ? { fs: 0, fe: fe, type: tok.type } : null;
+    }
+    var ls = s.lastIndexOf('\n', start - 1) + 1;
+    var le = s.indexOf('\n', start);
+    if (le < 0) le = s.length;
+    var m = s.slice(ls, le).match(LINE_PREFIX);
+    var fs = ls + (m ? m[0].length : 0);
+    return start >= fs && end <= le ? { fs: fs, fe: le, type: tok.type } : null;
+  }
 
-  function inlineLex(frag, marked) { return marked.Lexer.lexInline(frag); }
-
-  // Does re-lexing `md` yield a `kind` token whose raw is exactly `raw`?
-  function hasTokenRaw(md, raw, kind, marked) {
-    var found = false;
-    (function walk(ts) {
-      for (var i = 0; i < ts.length; i++) {
-        var t = ts[i];
-        if (t.type === kind && t.raw === raw) found = true;
-        if (t.tokens) walk(t.tokens);
+  // Snap a source offset (relative to the fragment) to a char index, through
+  // the provenance spans (their raws tile the fragment). Inside a pure text
+  // span the mapping is linear; inside a delimited span it is linear past the
+  // leading delimiter, clamped to the span's chars.
+  function srcToCharIdx(prov, srcOff) {
+    var acc = 0;
+    for (var k = 0; k < prov.length; k++) {
+      var sp = prov[k], re = acc + sp.raw.length, n = sp.to - sp.from;
+      if (srcOff < re) {
+        if (srcOff <= acc) return sp.from;
+        var plain = '';
+        for (var c = 0; c < sp.chars.length; c++) plain += sp.chars[c].obj ? ' ' : sp.chars[c].ch;
+        if (sp.raw === plain) return sp.from + Math.min(srcOff - acc, n);
+        var lead = provLeadLen(sp.raw);
+        return sp.from + Math.max(0, Math.min(srcOff - acc - lead, n));
       }
-    })(inlineLex(md, marked));
-    return found;
-  }
-
-  // Drop one level of same-kind emphasis inside an inline fragment, preserving
-  // everything else (links, other-kind emphasis) verbatim.
-  function stripSameKind(frag, kind, marked) {
-    return inlineLex(frag, marked).map(function (t) {
-      if (t.type === kind && t.tokens) return t.tokens.map(function (c) { return c.raw; }).join('');
-      return t.raw;
-    }).join('');
-  }
-
-  // Length of the contiguous '*' run ending just before / starting at offset i.
-  function starsBefore(s, i) { var n = 0; while (i - n - 1 >= 0 && s[i - n - 1] === '*') n++; return n; }
-  function starsAfter(s, i) { var n = 0; while (i + n < s.length && s[i + n] === '*') n++; return n; }
-
-  // Does a '*' run of length n on each side of a range carry `kind`?
-  // 1 = em, 2 = strong, 3 = em+strong — em needs an odd run, strong needs ≥ 2.
-  // Without this, the inner '*' of a ** delimiter passes the em slice check and
-  // Cmd+I on a bold word strips the bold instead of nesting italics.
-  function runCarries(left, right, kind) {
-    return kind === 'em' ? (left % 2 === 1 && right % 2 === 1) : (left >= 2 && right >= 2);
+      acc = re;
+    }
+    return prov.length ? prov[prov.length - 1].to : 0;
   }
 
   /**
    * Toggle bold/italic over a source range [start,end) within one block's
-   * markdown. Returns { md, selStart, selEnd } or null if the wrap wouldn't
-   * parse (e.g. wrapping whitespace). kind is 'strong' or 'em'.
+   * markdown. Returns { md, selStart, selEnd } or null if the toggle is
+   * refused (nothing togglable, unsupported constructs, or the result would
+   * not re-lex as the same block showing the same text). kind is 'strong' or
+   * 'em'. Implemented as parse → toggleAttr → canonicalize → print with
+   * raw-reuse — no delimiter arithmetic.
    */
   function toggleEmphasis(s, start, end, kind, marked) {
-    var d = delimFor(kind), dl = d.length;
-    var L = starsBefore(s, start), R = starsAfter(s, end);
-
-    // Unwrap: selection sits just inside the delimiters — **[sel]**
-    if (runCarries(L, R, kind) && start >= dl && s.slice(start - dl, start) === d && s.slice(end, end + dl) === d) {
-      return { md: s.slice(0, start - dl) + s.slice(start, end) + s.slice(end + dl), selStart: start - dl, selEnd: end - dl };
-    }
-    // Unwrap: selection includes the delimiters — [**sel**]
-    if (runCarries(starsAfter(s, start), starsBefore(s, end), kind) &&
-        end - start >= 2 * dl && s.slice(start, start + dl) === d && s.slice(end - dl, end) === d) {
-      return { md: s.slice(0, start) + s.slice(start + dl, end - dl) + s.slice(end), selStart: start, selEnd: end - 2 * dl };
-    }
-    // Split: the selection sits strictly inside a same-kind run — un-toggling
-    // a middle word. Close the run before the selection and reopen after it
-    // (*one two three* → *one* two *three*), keeping whitespace outside the
-    // new delimiters (a closing * preceded by a space doesn't lex).
-    var run = emphasisRunAt(s, start, end, kind, marked);
-    if (run) {
-      var before = s.slice(run.rs + dl, start), mid = s.slice(start, end), after = s.slice(end, run.re - dl);
-      var bCore = before.replace(/\s+$/, ''), bWS = before.slice(bCore.length);
-      var aWS = (after.match(/^\s*/) || [''])[0], aCore = after.slice(aWS.length);
-      var repl = (bCore ? d + bCore + d : '') + bWS + mid + aWS + (aCore ? d + aCore + d : '');
-      var selStart = run.rs + (bCore ? bCore.length + 2 * dl : 0) + bWS.length;
-      return { md: s.slice(0, run.rs) + repl + s.slice(run.re), selStart: selStart, selEnd: selStart + mid.length };
-    }
-    // Wrap: strip same-kind wrappers inside the selection, then wrap once.
-    var stripped = stripSameKind(s.slice(start, end), kind, marked);
-    var md = s.slice(0, start) + d + stripped + d + s.slice(end);
-    // The kind token's raw may absorb an adjacent run (em inside ** lexes as
-    // ***…***, raw spanning the whole run), so accept either form.
-    var absorbed = s.slice(start - L, start) + d + stripped + d + s.slice(end, end + R);
-    if (!hasTokenRaw(md, d + stripped + d, kind, marked) && !hasTokenRaw(md, absorbed, kind, marked)) return null;
-    return { md: md, selStart: start + dl, selEnd: start + dl + stripped.length };
-  }
-
-  // The innermost `kind` emphasis run whose content strictly contains
-  // [start,end) — the case where toggling means splitting the run, not
-  // wrapping or unwrapping. Returns { rs, re } raw span or null.
-  function emphasisRunAt(s, start, end, kind, marked) {
+    var span = inlineFragSpanAt(s, start, end, marked);
+    if (!span) return null;
+    var frag = s.slice(span.fs, span.fe);
+    var pr = parseInline(frag, marked);
+    if (!pr) return null;
+    var a = srcToCharIdx(pr.prov, start - span.fs);
+    var b = srcToCharIdx(pr.prov, end - span.fs);
+    if (a >= b) return null;
+    var attr = kind === 'strong' ? 'b' : 'i';
+    var toggled = toggleAttr(pr.text, a, b, attr);
+    if (toggled === pr.text) return null;
+    var B = printInlineParts(canonText(toggled), pr.prov, marked);
+    var md = s.slice(0, span.fs) + B.s + s.slice(span.fe);
+    // Refusal contract: the result must still lex as one block of the same
+    // type displaying exactly the same text, or the op does not happen.
     var toks;
-    try { toks = marked.lexer(s); } catch (_) { return null; }
-    if (toks.length === 0) return null;
-    var block = toks[0], dl = delimFor(kind).length;
-    var comps;
-    try { comps = compositeSpans(block, leafMap(block)); } catch (_) { return null; }
-    var best = null;
-    for (var i = 0; i < comps.length; i++) {
-      var c = comps[i];
-      if (c.token.type !== kind) continue;
-      if (start >= c.rs + dl && end <= c.re - dl && (start > c.rs + dl || end < c.re - dl)) {
-        if (!best || c.rs >= best.rs) best = c;
-      }
-    }
-    return best;
+    try { toks = marked.lexer(md); } catch (_) { return null; }
+    var real = [];
+    for (var t = 0; t < toks.length; t++) if (toks[t].type !== 'space') real.push(toks[t]);
+    if (real.length !== 1 || real[0].type !== span.type) return null;
+    if (displayTextOf(md, marked) !== displayTextOf(s, marked)) return null;
+    return { md: md, selStart: span.fs + B.pos[a], selEnd: span.fs + B.end[b - 1] };
   }
 
   // --- Enter split / Backspace merge ---------------------------------------
@@ -1075,5 +1365,15 @@
     stripStructuralWhitespace: stripStructuralWhitespace,
     atBlockEdge: atBlockEdge,
     adjacentEditableSeg: adjacentEditableSeg,
+    Model: {
+      parseInline: parseInline,
+      printInline: printInline,
+      printInlineParts: printInlineParts,
+      canonText: canonText,
+      toggleAttr: toggleAttr,
+      attrsEq: attrsEqM,
+      charEq: charEqM,
+      textEq: textEqM,
+    },
   };
 });

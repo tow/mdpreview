@@ -49,76 +49,10 @@
     });
   }
 
-  // --- Re-serializer + leaf substitution -----------------------------------
-  //
-  // `edits` is a Map keyed by text-leaf token (object identity) → new text.
-  // The DOM adapter builds this map by walking text nodes against the token
-  // tree; the pure tests build it directly.
-
   function childrenOf(token) {
     if (token.tokens && token.tokens.length) return token.tokens;
     if (token.items && token.items.length) return token.items;
     return null;
-  }
-
-  function anyEdited(token, edits) {
-    if (edits.has(token)) return true;
-    var kids = childrenOf(token);
-    if (!kids) return false;
-    for (var i = 0; i < kids.length; i++) {
-      if (anyEdited(kids[i], edits)) return true;
-    }
-    return false;
-  }
-
-  /**
-   * Rebuild a token's markdown source. Untouched subtrees return token.raw
-   * verbatim (so delimiters, escapes, entities, and unsupported constructs are
-   * never disturbed). An edited subtree is rebuilt as open + children + close,
-   * where the children's joined raw locates the affixes within token.raw.
-   */
-  function reserialize(token, edits) {
-    edits = edits || new Map();
-    var kids = childrenOf(token);
-    if (!kids) {
-      // Leaf. Only plain text leaves are substitutable; codespan/escape/etc.
-      // are opaque and pass through.
-      if (token.type === 'text' && edits.has(token)) return edits.get(token);
-      return token.raw;
-    }
-    if (!anyEdited(token, edits)) return token.raw;
-    // Locate each child's raw by forward search and keep the gaps between them
-    // (list markers, nested indentation, open/close affixes) verbatim. A single
-    // indexOf of the joined children fails for nested lists — marked strips a
-    // nested block's leading indentation from its raw, so the concatenation
-    // isn't a contiguous substring — which would silently drop the edit.
-    var raw = token.raw, out = '', search = 0;
-    for (var i = 0; i < kids.length; i++) {
-      var idx = raw.indexOf(kids[i].raw, search);
-      if (idx < 0) return token.raw; // can't locate — don't risk corruption
-      out += raw.slice(search, idx) + reserialize(kids[i], edits);
-      search = idx + kids[i].raw.length;
-    }
-    return out + raw.slice(search);
-  }
-
-  /**
-   * Apply pure text-leaf edits to a segment's raw. Splices each edited leaf's
-   * new text at its source span (from leafMap) — robust to nested lists, where
-   * the tree-walking reserialize can't reconstruct deindented child raws.
-   */
-  function applyLeafEdits(segment, edits) {
-    if (!edits || edits.size === 0) return segment.raw;
-    var leaves = leafMap(segment.token), ops = [];
-    for (var i = 0; i < leaves.length; i++) {
-      if (leaves[i].type === 'text' && edits.has(leaves[i].token)) {
-        ops.push({ start: leaves[i].rawStart, end: leaves[i].rawEnd, text: edits.get(leaves[i].token) });
-      }
-    }
-    ops.sort(function (a, b) { return b.start - a.start; }); // right-to-left so offsets stay valid
-    var raw = segment.raw;
-    for (var j = 0; j < ops.length; j++) raw = raw.slice(0, ops[j].start) + ops[j].text + raw.slice(ops[j].end);
-    return raw;
   }
 
   // --- StyledDoc model — inline layer ----------------------------------------
@@ -332,10 +266,10 @@
 
   function attrValOf(c, key) { return key === 'link' ? (c.attrs.link || null) : !!c.attrs[key]; }
 
-  function emitCharCanon(c, k, B) {
+  function emitCharCanon(c, k, B, noEsc) {
     B.pos[k] = B.s.length;
     if (c.obj) B.s += '![' + (c.alt || '') + '](' + c.src + (c.title ? ' "' + c.title + '"' : '') + ')';
-    else B.s += ESCAPABLE.test(c.ch) ? '\\' + c.ch : c.ch;
+    else B.s += (!noEsc && ESCAPABLE.test(c.ch)) ? '\\' + c.ch : c.ch;
     B.end[k] = B.s.length;
   }
 
@@ -354,27 +288,27 @@
     B.s += pad + fence;
   }
 
-  function printCanonInto(text, a, b, d, B) {
+  function printCanonInto(text, a, b, d, B, noEsc) {
     if (a >= b) return;
     if (d >= PRINT_PRIO.length) {
-      for (var k = a; k < b; k++) emitCharCanon(text[k], k, B);
+      for (var k = a; k < b; k++) emitCharCanon(text[k], k, B, noEsc);
       return;
     }
     var key = PRINT_PRIO[d], i = a;
     while (i < b) {
       var hv = attrValOf(text[i], key), j = i + 1;
       while (j < b && attrValOf(text[j], key) === hv) j++;
-      if (!hv) printCanonInto(text, i, j, d + 1, B);
+      if (!hv) printCanonInto(text, i, j, d + 1, B, noEsc);
       else if (key === 'link') {
         B.s += '[';
-        printCanonInto(text, i, j, d + 1, B);
+        printCanonInto(text, i, j, d + 1, B, noEsc);
         B.s += '](' + hv.href + (hv.title ? ' "' + hv.title + '"' : '') + ')';
       } else if (key === 'code') {
         emitCodeCanon(text, i, j, B);
       } else {
         var dlm = key === 'b' ? '**' : key === 'i' ? '*' : '~~';
         B.s += dlm;
-        printCanonInto(text, i, j, d + 1, B);
+        printCanonInto(text, i, j, d + 1, B, noEsc);
         B.s += dlm;
       }
       i = j;
@@ -421,7 +355,7 @@
   function printInlineParts(text, prov, marked) {
     var B = { s: '', pos: new Array(text.length), end: new Array(text.length) };
     if (!prov || !prov.length || !marked) {
-      printCanonInto(text, 0, text.length, 0, B);
+      printCanonInto(text, 0, text.length, 0, B, false);
       return B;
     }
     var i = 0, pi = 0;
@@ -434,15 +368,29 @@
       if (j - L >= i && matchChunk(text, j - L, sp.chars)) { tail.unshift(sp); sj--; j -= L; }
       else break;
     }
-    var at = 0, h;
-    for (h = 0; h < pi; h++) { emitProvSpan(prov[h], at, B); at += prov[h].chars.length; }
-    printCanonInto(text, i, j, 0, B);
-    at = j;
-    for (h = 0; h < tail.length; h++) { emitProvSpan(tail[h], at, B); at += tail[h].chars.length; }
-    var reparsed = parseInline(B.s, marked);
-    if (!reparsed || !textEqM(reparsed.text, canonText(text))) {
+    function assemble(noEsc) {
+      var A = { s: '', pos: new Array(text.length), end: new Array(text.length) };
+      var at = 0, h;
+      for (h = 0; h < pi; h++) { emitProvSpan(prov[h], at, A); at += prov[h].chars.length; }
+      printCanonInto(text, i, j, 0, A, noEsc);
+      at = j;
+      for (h = 0; h < tail.length; h++) { emitProvSpan(tail[h], at, A); at += tail[h].chars.length; }
+      return A;
+    }
+    function verified(A) {
+      var reparsed = parseInline(A.s, marked);
+      return reparsed && textEqM(reparsed.text, want) ? A : null;
+    }
+    var want = canonText(text);
+    // Bytes stay exactly what was typed when the unescaped form already
+    // renders right (a*b intraword stays literal); escape only when the
+    // reparse disagrees; a stale provenance adoption falls back to a full
+    // canonical print, which is always representable.
+    B = verified(assemble(true));
+    if (!B && i < j) B = verified(assemble(false));
+    if (!B) {
       B = { s: '', pos: new Array(text.length), end: new Array(text.length) };
-      printCanonInto(text, 0, text.length, 0, B);
+      printCanonInto(text, 0, text.length, 0, B, false);
     }
     return B;
   }
@@ -1543,62 +1491,11 @@
     return locateDisp(nodes, lastDisp, false);
   }
 
-  // Inline formatting elements our tokens render to, in document order.
-  function domSkeleton(el) {
-    return Array.prototype.map.call(el.querySelectorAll('strong,em,a,code,del'),
-      function (n) { return n.tagName.toUpperCase(); });
-  }
-  var TAG_FOR = { strong: 'STRONG', em: 'EM', link: 'A', codespan: 'CODE', del: 'DEL' };
-  function tokenSkeleton(blockToken) {
-    var out = [];
-    (function walk(token) {
-      var kids = childrenOf(token);
-      if (TAG_FOR[token.type]) out.push(TAG_FOR[token.type]);
-      if (kids) for (var i = 0; i < kids.length; i++) walk(kids[i]);
-    })(blockToken);
-    return out;
-  }
-
-  /**
-   * Read a pure-text edit out of an edited block element as a leaf-edits map.
-   * Returns { edits, clean }. clean is false when the inline structure changed
-   * (a formatting boundary was crossed) — those go through the structural ops,
-   * not leaf substitution.
-   */
-  function readEditsFromDom(el, blockToken) {
-    var leaves = leafMap(blockToken);
-    var oldDisp = leaves.map(function (L) { return dispShownOf(L.token); }).join('');
-    var newDisp = (el.textContent || '').replace(/\n+$/, '');
-    if (newDisp === oldDisp) return { edits: new Map(), clean: true };
-    if (domSkeleton(el).join(',') !== tokenSkeleton(blockToken).join(',')) {
-      return { edits: new Map(), clean: false };
-    }
-    var minLen = Math.min(oldDisp.length, newDisp.length);
-    var p = 0;
-    while (p < minLen && oldDisp[p] === newDisp[p]) p++;
-    var s = 0;
-    while (s < minLen - p && oldDisp[oldDisp.length - 1 - s] === newDisp[newDisp.length - 1 - s]) s++;
-    var oldEnd = oldDisp.length - s;
-    var newSub = newDisp.slice(p, newDisp.length - s);
-    // The change must sit within a single text leaf to be a clean leaf edit.
-    var container = null;
-    for (var i = 0; i < leaves.length; i++) {
-      var L = leaves[i];
-      if (L.type === 'text' && p >= L.dispStart && oldEnd <= L.dispEnd) { container = L; break; }
-    }
-    if (!container) return { edits: new Map(), clean: false };
-    var dt = dispTextOf(container.token);
-    var newText = dt.slice(0, p - container.dispStart) + newSub + dt.slice(oldEnd - container.dispStart);
-    var edits = new Map();
-    edits.set(container.token, newText);
-    return { edits: edits, clean: true };
-  }
-
   // --- Generalized DOM edit reconciliation ----------------------------------
   //
-  // readEditsFromDom handles the fast path: an edit confined to one text leaf.
-  // Everything else the browser can do to a contenteditable block — selection
-  // deletes spanning leaves, items, or whole formatting runs — lands here.
+  // Everything the browser can do to a contenteditable block — from a single
+  // typed char to selection deletes spanning leaves, items, or whole
+  // formatting runs — lands here.
   // The contract that matters: an edit that exists in the DOM must either be
   // folded into the source or be reported as impossible; it must never sit
   // silently in the DOM to be resurrected by the next re-render.
@@ -1739,8 +1636,6 @@
   return {
     segment: segment,
     isEditableBlock: isEditableBlock,
-    reserialize: reserialize,
-    applyLeafEdits: applyLeafEdits,
     toggleEmphasis: toggleEmphasis,
     splitBlock: splitBlock,
     mergeBlock: mergeBlock,
@@ -1750,7 +1645,6 @@
     reconcile: reconcile,
     domOffsetToSourceOffset: domOffsetToSourceOffset,
     sourceOffsetToDom: sourceOffsetToDom,
-    readEditsFromDom: readEditsFromDom,
     reconcileDomEdit: reconcileDomEdit,
     displayTextOf: displayTextOf,
     renderedDisplayOf: renderedDisplayOf,

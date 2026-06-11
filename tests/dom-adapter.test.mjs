@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { core, marked } from './_setup.mjs';
 
-// Step 6: the DOM adapter maps between a rendered block element and source
-// offsets, and reads pure-text edits back out as a leaf-edits map. These are
-// the only DOM-coupled functions; everything they compute is checked against
-// the pure core (segment/reserialize/applyLeafEdits).
+// The DOM caret adapter maps between a rendered block element and source
+// offsets — selection plumbing for the structural ops. (Edit readback lives
+// in the model: readBlocksFromDom / reconcileDomEdit.)
 
 // Render one block's markdown into a detached <div data-seg> like the app does.
 // The app strips structural whitespace at render time (so textContent matches
@@ -71,31 +70,20 @@ test('offsets inside an escape clamp to the leaf boundary', () => {
   assert.equal(core.domOffsetToSourceOffset(el, after.node, after.offset, seg.token), 4);
 });
 
-test('readEditsFromDom returns no edits when nothing changed', () => {
-  const { seg, el } = renderBlock('unchanged text');
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, true);
-  assert.equal(r.edits.size, 0);
-});
-
-test('editing a plain word yields a leaf edit that applyLeafEdits can replay', () => {
+test('editing a plain word folds back through the reconciler', () => {
   const md = 'the quick fox';
   const { seg, el } = renderBlock(md);
-  // Simulate the user editing the text: "quick" -> "slow".
   el.querySelector('p').textContent = 'the slow fox';
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, true);
-  assert.equal(core.applyLeafEdits(seg, r.edits), 'the slow fox');
+  const r = core.reconcileDomEdit(el, seg.token, marked);
+  assert.equal(r.raw, 'the slow fox');
 });
 
-test('editing text inside bold preserves the ** delimiters on replay', () => {
+test('editing text inside bold preserves the ** delimiters', () => {
   const md = 'a **bold** c';
   const { seg, el } = renderBlock(md);
-  // Edit only the bold word's text node.
   el.querySelector('strong').firstChild.textContent = 'BOLD';
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, true);
-  assert.equal(core.applyLeafEdits(seg, r.edits), 'a **BOLD** c');
+  const r = core.reconcileDomEdit(el, seg.token, marked);
+  assert.equal(r.raw, 'a **BOLD** c');
 });
 
 test('editing text inside a nested list item folds back (does not drop the edit)', () => {
@@ -103,18 +91,8 @@ test('editing text inside a nested list item folds back (does not drop the edit)
   const { seg, el } = renderBlock(md);
   const lis = el.querySelectorAll('li');
   lis[lis.length - 1].firstChild.textContent = 'xyz'; // type "yz" after "x"
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, true);
-  assert.equal(core.applyLeafEdits(seg, r.edits), '- one\n  * xyz');
-});
-
-test('a change spanning a formatting boundary is reported not-clean', () => {
-  const md = 'a **bold** c';
-  const { seg, el } = renderBlock(md);
-  // Collapse everything into one text node — crosses the <strong> boundary.
-  el.querySelector('p').textContent = 'a X c';
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, false);
+  const r = core.reconcileDomEdit(el, seg.token, marked);
+  assert.equal(r.raw, '- one\n  * xyz');
 });
 
 // --- Lists ---------------------------------------------------------------
@@ -219,13 +197,12 @@ test('a caret in a new empty list item resolves to that empty <li>', () => {
   assert.ok(back >= 12 && back <= 15, `got ${back}`);
 });
 
-test('readEditsFromDom returns a clean leaf edit for an interior list edit', () => {
+test('an interior list edit folds back, untouched items byte-identical', () => {
   const md = '- one\n- two\n';
   const { seg, el } = renderBlock(md);
   // Edit the first item's text node "one" -> "ONE".
   const li = el.querySelectorAll('li')[0];
   li.firstChild.textContent = 'ONE';
-  const r = core.readEditsFromDom(el, seg.token);
-  assert.equal(r.clean, true);
-  assert.equal(core.applyLeafEdits(seg, r.edits), '- ONE\n- two\n');
+  const r = core.reconcileDomEdit(el, seg.token, marked);
+  assert.equal(r.raw, '- ONE\n- two\n');
 });

@@ -149,6 +149,18 @@
     }).join('');
   }
 
+  // Length of the contiguous '*' run ending just before / starting at offset i.
+  function starsBefore(s, i) { var n = 0; while (i - n - 1 >= 0 && s[i - n - 1] === '*') n++; return n; }
+  function starsAfter(s, i) { var n = 0; while (i + n < s.length && s[i + n] === '*') n++; return n; }
+
+  // Does a '*' run of length n on each side of a range carry `kind`?
+  // 1 = em, 2 = strong, 3 = em+strong — em needs an odd run, strong needs ≥ 2.
+  // Without this, the inner '*' of a ** delimiter passes the em slice check and
+  // Cmd+I on a bold word strips the bold instead of nesting italics.
+  function runCarries(left, right, kind) {
+    return kind === 'em' ? (left % 2 === 1 && right % 2 === 1) : (left >= 2 && right >= 2);
+  }
+
   /**
    * Toggle bold/italic over a source range [start,end) within one block's
    * markdown. Returns { md, selStart, selEnd } or null if the wrap wouldn't
@@ -156,19 +168,24 @@
    */
   function toggleEmphasis(s, start, end, kind, marked) {
     var d = delimFor(kind), dl = d.length;
+    var L = starsBefore(s, start), R = starsAfter(s, end);
 
     // Unwrap: selection sits just inside the delimiters — **[sel]**
-    if (start >= dl && s.slice(start - dl, start) === d && s.slice(end, end + dl) === d) {
+    if (runCarries(L, R, kind) && start >= dl && s.slice(start - dl, start) === d && s.slice(end, end + dl) === d) {
       return { md: s.slice(0, start - dl) + s.slice(start, end) + s.slice(end + dl), selStart: start - dl, selEnd: end - dl };
     }
     // Unwrap: selection includes the delimiters — [**sel**]
-    if (end - start >= 2 * dl && s.slice(start, start + dl) === d && s.slice(end - dl, end) === d) {
+    if (runCarries(starsAfter(s, start), starsBefore(s, end), kind) &&
+        end - start >= 2 * dl && s.slice(start, start + dl) === d && s.slice(end - dl, end) === d) {
       return { md: s.slice(0, start) + s.slice(start + dl, end - dl) + s.slice(end), selStart: start, selEnd: end - 2 * dl };
     }
     // Wrap: strip same-kind wrappers inside the selection, then wrap once.
     var stripped = stripSameKind(s.slice(start, end), kind, marked);
     var md = s.slice(0, start) + d + stripped + d + s.slice(end);
-    if (!hasTokenRaw(md, d + stripped + d, kind, marked)) return null;
+    // The kind token's raw may absorb an adjacent run (em inside ** lexes as
+    // ***…***, raw spanning the whole run), so accept either form.
+    var absorbed = s.slice(start - L, start) + d + stripped + d + s.slice(end, end + R);
+    if (!hasTokenRaw(md, d + stripped + d, kind, marked) && !hasTokenRaw(md, absorbed, kind, marked)) return null;
     return { md: md, selStart: start + dl, selEnd: start + dl + stripped.length };
   }
 

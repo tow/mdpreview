@@ -160,3 +160,26 @@ test('Tab on a blank line starts a new list', async () => {
   beforeInput(t.win, 'insertText', 'x');
   assert.equal(t.md(), 'hello\n\n- x\n');
 });
+
+// Select `text` (within a single text node) and press a Cmd+key shortcut the
+// way onKeydown receives it from WKWebView.
+function selectAndPressCmd(win, text, key) {
+  const doc = win.document, sel = win.getSelection(), r = doc.createRange();
+  const walk = doc.createTreeWalker(doc.getElementById('content'), win.NodeFilter.SHOW_TEXT);
+  let n, node = null;
+  while ((n = walk.nextNode())) { if (n.textContent.includes(text)) { node = n; break; } }
+  const i = node.textContent.indexOf(text);
+  r.setStart(node, i); r.setEnd(node, i + text.length);
+  sel.removeAllRanges(); sel.addRange(r);
+  const ev = new win.KeyboardEvent('keydown', { key, metaKey: true, bubbles: true, cancelable: true });
+  win.getSelection().anchorNode.parentNode.dispatchEvent(ev);
+}
+
+test('Cmd+B then Cmd+I on the same word stacks bold and italic', async () => {
+  const t = await setup('hello world\n');
+  selectAndPressCmd(t.win, 'world', 'b');
+  assert.equal(t.md(), 'hello **world**\n');
+  // doEmphasis restores the selection over "world" inside the bold run
+  selectAndPressCmd(t.win, 'world', 'i');
+  assert.equal(t.md(), 'hello ***world***\n');
+});

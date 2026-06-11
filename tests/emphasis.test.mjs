@@ -54,3 +54,39 @@ test('refuses (returns null) when the wrap would not parse as emphasis', () => {
   const r = core.toggleEmphasis(s, at(s, ' '), at(s, ' ') + 1, 'strong', marked);
   assert.equal(r, null);
 });
+
+test('em inside a bold word nests (***), not strips the bold', () => {
+  const s = 'hello **world**';
+  const start = at(s, 'world');
+  const r = core.toggleEmphasis(s, start, start + 5, 'em', marked);
+  assert.equal(r.md, 'hello ***world***');
+  assert.equal(r.md.slice(r.selStart, r.selEnd), 'world');
+});
+
+test('em with the bold delimiters inside the selection also nests', () => {
+  const s = 'hello **world**';
+  const start = at(s, '**world**');
+  const r = core.toggleEmphasis(s, start, start + '**world**'.length, 'em', marked);
+  assert.equal(r.md, 'hello ***world***');
+});
+
+test('em unwraps one level from em+strong (*** → **)', () => {
+  const s = 'hello ***world***';
+  const start = at(s, 'world');
+  const r = core.toggleEmphasis(s, start, start + 5, 'em', marked);
+  assert.equal(r.md, 'hello **world**');
+});
+
+test('strong unwraps from em+strong leaving the em (*** → *)', () => {
+  const s = 'hello ***world***';
+  const start = at(s, 'world');
+  const r = core.toggleEmphasis(s, start, start + 5, 'strong', marked);
+  assert.equal(r.md, 'hello *world*');
+});
+
+test('strong inside an italic word nests (***)', () => {
+  const s = 'hello *world*';
+  const start = at(s, 'world');
+  const r = core.toggleEmphasis(s, start, start + 5, 'strong', marked);
+  assert.equal(r.md, 'hello ***world***');
+});

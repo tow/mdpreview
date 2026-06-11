@@ -667,6 +667,49 @@
 
   var READ_INLINE_TAGS = { STRONG: 'b', B: 'b', EM: 'i', I: 'i', CODE: 'code', DEL: 'del', S: 'del', STRIKE: 'del' };
 
+  // --- visibility -----------------------------------------------------------------
+  // The DOM the reconciler reads has been chewed on by WebKit's editing
+  // engine, which strews placeholder nodes — a caret <br>, emptied <li>s,
+  // stray wrappers — that no rendered markdown contains. Rather than
+  // cataloguing those artifacts, readback and the canonical fingerprint both
+  // judge nodes by what they RENDER: a subtree that shows nothing is a
+  // leftover to skip, whatever its tags; only nodes with visible content may
+  // refuse an edit. Safe because reconcileDomEdit's acceptance compares
+  // display text and canonical structure — skipping can never drop anything
+  // visible. VISIBLE_EMPTY: elements that render without text content.
+  var VISIBLE_EMPTY = 'img,hr,input,video,audio,iframe,embed,object,canvas,svg,button,select,textarea,progress,meter';
+  var VISIBLE_EMPTY_TAGS = (function () {
+    var m = {};
+    VISIBLE_EMPTY.split(',').forEach(function (t) { m[t.toUpperCase()] = 1; });
+    return m;
+  })();
+  function subtreeVisible(n) {
+    if (n.nodeType === 3) return n.textContent.length > 0;
+    if (n.nodeType !== 1) return false;
+    if (VISIBLE_EMPTY_TAGS[n.tagName.toUpperCase()]) return true;
+    return !!n.textContent.length || !!n.querySelector(VISIBLE_EMPTY);
+  }
+  // A <br> renders a line break only when something visible follows it inside
+  // its block; trailing, or alone in an emptied block, it is the editing
+  // engine's caret placeholder.
+  function brIsContent(br, root) {
+    var block = br.parentNode, tag;
+    while (block !== root) {
+      tag = (block.tagName || '').toUpperCase();
+      if (tag === 'P' || tag === 'LI' || tag === 'BLOCKQUOTE' || /^H[1-6]$/.test(tag)) break;
+      block = block.parentNode;
+    }
+    var n = br;
+    for (;;) {
+      while (!n.nextSibling) {
+        n = n.parentNode;
+        if (!n || n === block) return false;
+      }
+      n = n.nextSibling;
+      if (subtreeVisible(n)) return true;
+    }
+  }
+
   function readBlocksFromDom(el, base) {
     var root = el.cloneNode(true);
     stripStructuralWhitespace(root);
@@ -688,12 +731,11 @@
         out.push({ obj: 'image', src: deBase(n.getAttribute('src')), alt: n.getAttribute('alt') || '', title: n.getAttribute('title') || '', attrs: copyAttrs(attrs) });
         return true;
       }
-      var empty = !n.textContent.length && !n.querySelector('img');
-      if (empty && (READ_INLINE_TAGS[tag] || tag === 'A' || tag === 'SPAN')) return true; // zombie
+      if (!subtreeVisible(n)) return true; // zombie/leftover, incl. placeholder <br>
       var a2;
       if (READ_INLINE_TAGS[tag]) { a2 = copyAttrs(attrs); a2[READ_INLINE_TAGS[tag]] = true; }
       else if (tag === 'A') { a2 = copyAttrs(attrs); a2.link = { href: deBase(n.getAttribute('href')), title: n.getAttribute('title') || '' }; }
-      else return false; // BR, inputs, unknown structure
+      else return false; // visible unknown structure (inputs, wrappers with content)
       for (var c = n.firstChild; c; c = c.nextSibling) if (!readInlineNode(c, a2, out)) return false;
       return true;
     }
@@ -708,6 +750,13 @@
       for (var li = listEl.firstChild; li; li = li.nextSibling) {
         if (li.nodeType === 3) { if (/^\s*$/.test(li.textContent)) continue; return false; }
         if (li.nodeType !== 1 || li.tagName.toUpperCase() !== 'LI') return false;
+        if (!subtreeVisible(li)) {
+          // Visually empty item — whatever placeholder nodes it holds (<br>,
+          // empty <p>) are deletion leftovers, not content. Keep the bullet.
+          blocks.push({ kind: 'listItem', depth: depth, marker: null, ordered: ordered, num: num, text: [], prov: null, raw: null, sep: null });
+          num++;
+          continue;
+        }
         var text = [], nested = [], seenP = false;
         for (var n = li.firstChild; n; n = n.nextSibling) {
           var tag = n.nodeType === 1 ? n.tagName.toUpperCase() : '';
@@ -717,7 +766,7 @@
             return false; // inline content after a nested list
           }
           if (tag === 'P') {
-            if (!n.textContent.length && !n.querySelector('img')) continue; // leftover
+            if (!subtreeVisible(n)) continue; // leftover
             if (seenP || text.length) return false; // multi-paragraph item
             seenP = true;
             if (!readInline(n, text)) return false;
@@ -746,7 +795,7 @@
           if (!readInline(n, ht)) return false;
           blocks.push({ kind: 'heading', level: parseInt(hm[1], 10), text: ht, prov: null, raw: null, sep: null });
         } else if (tag === 'P') {
-          if (!n.textContent.length && !n.querySelector('img')) continue; // leftover
+          if (!subtreeVisible(n)) continue; // leftover
           var pt = [];
           if (!readInline(n, pt)) return false;
           blocks.push({ kind: 'paragraph', text: pt, prov: null, raw: null, sep: null });
@@ -755,17 +804,20 @@
           for (var c = n.firstChild; c; c = c.nextSibling) {
             if (c.nodeType === 3) { if (!/^\s*$/.test(c.textContent)) return false; continue; }
             if (c.nodeType !== 1) continue;
+            if (!subtreeVisible(c)) continue; // leftover
             if (c.tagName.toUpperCase() !== 'P') return false;
             ps.push(c);
           }
-          if (ps.length !== 1) return false; // multi-block quote — out of model
+          if (ps.length > 1) return false; // multi-block quote — out of model
           var qt = [];
-          if (!readInline(ps[0], qt)) return false;
+          if (ps.length && !readInline(ps[0], qt)) return false;
           blocks.push({ kind: 'quote', text: qt, prov: null, raw: null, sep: null });
         } else if (tag === 'UL' || tag === 'OL') {
           if (!readList(n, 0)) return false;
+        } else if (!subtreeVisible(n)) {
+          continue; // invisible junk (placeholder <br>, emptied wrappers)
         } else {
-          return false;
+          return false; // visible structure outside the model
         }
       }
       return true;
@@ -1519,13 +1571,14 @@
   // targets, image sources all participate.
   //
   // The explicit allowlist of permitted differences:
-  //  - empty inline formatting elements (a zombie <em> renders as nothing)
-  //  - empty <li>/<p> (the browser's leftovers after a big deletion can't be
-  //    matched one-for-one to source bullets; requiring it would make
-  //    whole-list deletion unreconcilable — worse than a transient ghost)
+  //  - invisible subtrees (per subtreeVisible — zombie inline elements and
+  //    the editing engine's leftovers: emptied <li>/<p>, stray wrappers;
+  //    requiring a one-for-one match would make whole-block deletion
+  //    unreconcilable — worse than a transient ghost)
+  //  - placeholder <br>s (per brIsContent — only a break with visible
+  //    content after it inside its block renders anything)
   //  - element attributes other than href/src/alt (classes, data-*)
   //  - `base` prefix on href/src (the live DOM resolves relative paths)
-  var INLINE_FMT = { STRONG: 1, EM: 1, A: 1, CODE: 1, DEL: 1 };
   function canonicalOfEl(el, base) {
     var out = [], buf = '';
     function flush() { if (buf) { out.push(JSON.stringify(buf)); buf = ''; } }
@@ -1539,9 +1592,8 @@
         if (n.nodeType !== 1) continue;
         var tag = n.tagName.toUpperCase();
         if (tag === 'IMG') { flush(); out.push('IMG[' + deBase(n.getAttribute('src')) + '|' + (n.getAttribute('alt') || '') + ']'); continue; }
-        if (tag === 'BR') { flush(); out.push('BR'); continue; }
-        var empty = !n.textContent.length && !n.querySelector('img');
-        if (empty && (INLINE_FMT[tag] || tag === 'LI' || tag === 'P' || tag === 'UL' || tag === 'OL')) continue;
+        if (tag === 'BR') { if (!brIsContent(n, el)) continue; flush(); out.push('BR'); continue; }
+        if (!subtreeVisible(n)) continue;
         flush();
         out.push(tag + (tag === 'A' ? '[' + deBase(n.getAttribute('href')) + ']' : '') + '(');
         walk(n);

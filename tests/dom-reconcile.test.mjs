@@ -136,3 +136,66 @@ test('an image deletion the DOM did not make is refused', () => {
   const r = core.reconcileDomEdit(t.el, t.token, marked);
   assert.equal(r.changed, false);
 });
+
+// WebKit's whole-block deletions don't leave a clean empty tree: they park
+// the caret on a <br> placeholder, alone in the root or inside a surviving
+// empty <li>. These used to be unreconcilable and reverted the deletion.
+
+test('select-all-delete leaving <ul><li><br></li></ul> empties the block', () => {
+  const t = renderBlock('- *On slide:* alpha\n- *Script:* bravo charlie\n');
+  t.el.innerHTML = '<ul><li><br></li></ul>';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.ok(r && r.changed && r.empty, 'must reconcile as emptied, not revert');
+  assert.equal(core.displayTextOf(r.raw, marked), '', 'no visible text may survive');
+});
+
+test('select-all-delete leaving a bare <br> in the root empties the block', () => {
+  const t = renderBlock('- *On slide:* alpha\n- *Script:* bravo charlie\n');
+  t.el.innerHTML = '<br>';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.ok(r && r.changed && r.empty, 'must reconcile as emptied, not revert');
+  assert.equal(r.raw, '');
+});
+
+test('one item emptied to <li><br></li> among intact siblings keeps its bullet', () => {
+  const t = renderBlock('- one\n- two\n- three\n');
+  const li = t.el.querySelectorAll('li')[1];
+  li.innerHTML = '<br>';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.ok(r && r.changed, 'must reconcile, not revert');
+  assert.equal(core.displayTextOf(r.raw, marked), 'onethree');
+});
+
+// Junk-tolerance is by visibility, not by a tag catalogue: any subtree that
+// renders nothing is a leftover; anything visible must reconcile or refuse.
+
+test('an unknown invisible wrapper left by the editor is ignored', () => {
+  const t = renderBlock('- one\n- two\n');
+  t.el.innerHTML = '<div><span></span><br></div>';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.ok(r && r.changed && r.empty, 'must reconcile as emptied, not revert');
+});
+
+test('a trailing placeholder <br> after surviving text is not a change', () => {
+  const t = renderBlock('- one\n- two\n');
+  t.el.querySelectorAll('li')[1].appendChild(t.doc.createElement('br'));
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r.changed, false);
+});
+
+test('a content-bearing <br> (hard line break) still refuses, never drops', () => {
+  const t = renderBlock('alpha bravo');
+  // simulate an edit that splits the line with a real break: "alpha<br>bravo"
+  const p = t.el.querySelector('p');
+  p.innerHTML = 'alpha<br>bravo';
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r, null, 'a visible break is out of model — refuse, do not flatten');
+});
+
+test('a visible empty element (pasted checkbox) refuses, never silently drops', () => {
+  const t = renderBlock('alpha bravo');
+  const p = t.el.querySelector('p');
+  p.insertBefore(t.doc.createElement('input'), p.firstChild);
+  const r = core.reconcileDomEdit(t.el, t.token, marked);
+  assert.equal(r, null, 'visible non-text content is out of model — refuse');
+});

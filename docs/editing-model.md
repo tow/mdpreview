@@ -61,3 +61,16 @@ functions on the model and therefore *are* their specs.
   still untested by the fuzzer.
 - WebKit-vs-jsdom fidelity of emulated default editing — backstopped by the
   editor.log transcript (~/Library/Logs/MarkdownPreview/editor.log).
+  Bitten 2026-06-11: whole-list select-delete reverted. Readback modeled only
+  the shapes marked renders, but the DOM it reads has been chewed on by
+  WebKit's editing engine, which strews artifacts — caret-placeholder `<br>`,
+  emptied `<li>`s, stray wrappers — that no rendered markdown contains.
+  Resolution: don't catalogue artifacts; judge nodes by what they render.
+  A shared visibility predicate (`subtreeVisible`/`brIsContent` in
+  editor-core.js) makes readback and canonicalOfEl skip any subtree that
+  shows nothing, whatever its tags; only visible out-of-model content
+  refuses. Safe because the acceptance check compares display text and
+  canonical structure, so skipping can never drop anything visible. Still
+  test with remnants real WebKit gestures leave behind (hard-coded in
+  dom-reconcile.test.mjs) — jsdom has no editing engine, so hand-built
+  mutations are cleaner than reality.

@@ -595,7 +595,7 @@
             }
             if (!rec.changed) return true;
             elog('flush seg=' + i + ' reconciled ' + exc(seg.raw) + ' -> ' + exc(rec.raw) + (rec.empty ? ' (emptied)' : ''));
-            if (rec.empty && seg.type === 'paragraph') {
+            if (rec.empty && (seg.type === 'paragraph' || rec.raw === '')) {
                 // All visible text gone: the block has no source bytes left worth
                 // keeping. Convert to a transient empty paragraph — the same
                 // shape Enter-at-end creates — so typing/Return behave normally.

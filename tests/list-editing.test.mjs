@@ -24,7 +24,10 @@ test('Return at the end of the last item appends a new empty item', () => {
 test('Return at the end of a non-last item inserts a new empty item after it', () => {
   const s = '- one\n- two\n';
   const r = core.splitBlock(s, 5, marked); // caret after "one"
-  assert.equal(r.md, '- one\n- \n- two\n');
+  // Amended "- \n" → "-\n" with the model printer (display + rendered
+  // canonical verified identical): the bare marker is the one form that lexes
+  // as an empty item in every list position.
+  assert.equal(r.md, '- one\n-\n- two\n');
   assert.ok(roundTrips(r.md));
 });
 

@@ -577,18 +577,54 @@
   }
 
   // A canonically-printed line must not re-lex as block structure (a printed
-  // paragraph line starting "- " would become a list). Escape the marker.
-  function guardBlockPrefix(line) {
+  // paragraph line starting "- " would become a list). Escape the marker;
+  // `at` reports where the backslash went so caret mapping can shift past it.
+  function guardBlockPrefixPos(line) {
     var m = line.match(/^([ \t]*)(#{1,6})[ \t]/);
-    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
+    if (m) return { s: line.slice(0, m[1].length) + '\\' + line.slice(m[1].length), at: m[1].length };
     m = line.match(/^([ \t]*)([-*+])([ \t]|$)/);
-    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
+    if (m) return { s: line.slice(0, m[1].length) + '\\' + line.slice(m[1].length), at: m[1].length };
     m = line.match(/^([ \t]*)(\d+)([.)])([ \t]|$)/);
-    if (m) return m[1] + m[2] + '\\' + line.slice(m[1].length + m[2].length);
+    if (m) return { s: m[1] + m[2] + '\\' + line.slice(m[1].length + m[2].length), at: m[1].length + m[2].length };
     m = line.match(/^([ \t]*)(=+|-+)[ \t]*$/); // setext underline / hr
-    if (m) return line.slice(0, m[1].length) + '\\' + line.slice(m[1].length);
-    if (line.charAt(0) === '>') return '\\' + line;
-    return line;
+    if (m) return { s: line.slice(0, m[1].length) + '\\' + line.slice(m[1].length), at: m[1].length };
+    if (line.charAt(0) === '>') return { s: '\\' + line, at: 0 };
+    return { s: line, at: -1 };
+  }
+  function guardBlockPrefix(line) { return guardBlockPrefixPos(line).s; }
+
+  /**
+   * Render a styled (non-listItem) block's body — prefix + inline content,
+   * sans separator. When `ch` is given, `pos` maps that char index to a byte
+   * offset within the body (through guard escapes and quote prefixes).
+   */
+  function renderBlockBody(b, marked, ch) {
+    var parts = printInlineParts(canonText(b.text), b.prov || null, marked);
+    var inline = parts.s;
+    var local = -1;
+    if (ch != null) {
+      local = ch >= b.text.length ? inline.length : parts.pos[ch];
+      if (local == null) local = inline.length;
+    }
+    if (b.kind === 'heading') {
+      var pre = new Array((b.level || 1) + 1).join('#') + ' ';
+      return { s: pre + inline, pos: local >= 0 ? pre.length + local : -1 };
+    }
+    var quote = b.kind === 'quote';
+    var lines = inline.split('\n'), built = '', acc = 0, pos = -1;
+    for (var li = 0; li < lines.length; li++) {
+      var g = guardBlockPrefixPos(lines[li]);
+      var prefix = quote ? (g.s ? '> ' : '>') : '';
+      if (local >= acc && local <= acc + lines[li].length && pos < 0) {
+        var rel = local - acc;
+        if (g.at >= 0 && rel > g.at) rel++;
+        pos = built.length + prefix.length + rel;
+      }
+      built += prefix + g.s;
+      if (li < lines.length - 1) built += '\n';
+      acc += lines[li].length + 1;
+    }
+    return { s: built, pos: pos };
   }
 
   function markerTextOf(marker) {
@@ -601,17 +637,26 @@
    * byte-identical; touched blocks print canonically, with list indentation
    * derived from the actual parent marker width (marked's content-column
    * nesting rule — 2 spaces under "- ", 3 under "1. ").
+   *
+   * `caret` ({ block, ch }) is optional: the printer records the byte offset
+   * of char `ch` of block `block` into caret.offset.
    */
-  function printBlocks(blocks, marked) {
+  function printBlocks(blocks, marked, caret) {
     var out = '', sibIndent = [], childIndent = [];
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i];
+      var wantCaret = caret && caret.block === i;
       if (b.kind !== 'listItem') { sibIndent = []; childIndent = []; }
-      if (b.kind === 'opaque') { out += b.raw; continue; }
+      if (b.kind === 'opaque') {
+        if (wantCaret) caret.offset = out.length;
+        out += b.raw;
+        continue;
+      }
       if (b.kind === 'listItem') {
         var indent, mk;
         if (b.raw != null) {
-          var lm = b.raw.match(LIST_LINE_M);
+          var firstNl = b.raw.indexOf('\n');
+          var lm = b.raw.slice(0, firstNl < 0 ? b.raw.length : firstNl).match(LIST_LINE_M);
           indent = lm ? lm[1] : '';
           mk = lm ? lm[2] : '-';
         } else {
@@ -624,31 +669,40 @@
         childIndent.length = b.depth + 1;
         sibIndent[b.depth] = indent;
         childIndent[b.depth] = indent + new Array(mk.length + 2).join(' ');
-        if (b.raw != null) { out += b.raw; continue; }
+        if (b.raw != null) {
+          if (wantCaret) caret.offset = out.length;
+          out += b.raw;
+          continue;
+        }
         var sepL = b.sep != null ? b.sep : '\n';
         if (!b.text.length) {
-          // a bare marker (no trailing space) round-trips; an indented empty
-          // "-" would lex as a setext underline, so it becomes "*"
+          // an empty item is a bare marker: "- " with a trailing space lexes
+          // as a paragraph at the head or tail of a list, bare "-" is an item
+          // in every position; an indented empty "-" would lex as a setext
+          // underline, so it becomes "*"
           if (b.depth > 0 && mk === '-') mk = '*';
+          if (wantCaret) caret.offset = out.length + indent.length + mk.length;
           out += indent + mk + sepL;
           continue;
         }
-        out += indent + mk + ' ' + printInline(canonText(b.text), b.prov || null, marked) + sepL;
+        var parts = printInlineParts(canonText(b.text), b.prov || null, marked);
+        if (wantCaret) {
+          var local = caret.ch >= b.text.length ? parts.s.length : parts.pos[caret.ch];
+          if (local == null) local = parts.s.length;
+          caret.offset = out.length + indent.length + mk.length + 1 + local;
+        }
+        out += indent + mk + ' ' + parts.s + sepL;
         continue;
       }
-      if (b.raw != null) { out += b.raw; continue; }
-      var sep = b.sep != null ? b.sep : '\n';
-      var inline = printInline(canonText(b.text), b.prov || null, marked);
-      if (b.kind === 'heading') {
-        out += new Array((b.level || 1) + 1).join('#') + ' ' + inline + sep;
-      } else if (b.kind === 'quote') {
-        out += inline.split('\n').map(function (l) {
-          l = guardBlockPrefix(l);
-          return l ? '> ' + l : '>';
-        }).join('\n') + sep;
-      } else { // paragraph
-        out += inline.split('\n').map(guardBlockPrefix).join('\n') + sep;
+      if (b.raw != null) {
+        if (wantCaret) caret.offset = out.length;
+        out += b.raw;
+        continue;
       }
+      var sep = b.sep != null ? b.sep : '\n';
+      var body = renderBlockBody(b, marked, wantCaret ? caret.ch : null);
+      if (wantCaret) caret.offset = out.length + (body.pos >= 0 ? body.pos : body.s.length);
+      out += body.s + sep;
     }
     return out;
   }
@@ -929,222 +983,274 @@
     return { md: md, selStart: span.fs + B.pos[a], selEnd: span.fs + B.end[b - 1] };
   }
 
-  // --- Enter split / Backspace merge ---------------------------------------
-
-  function wrapDelim(type) {
-    return type === 'strong' ? '**' : type === 'del' ? '~~' : type === 'em' ? '*' : '';
-  }
-
-  // Split a token at a byte offset within its raw, returning { left, right }
-  // markdown. Wrappers spanning the offset are closed on the left and reopened
-  // on the right; plain text is sliced; opaque leaves go whole to one side.
-  function splitToken(token, local) {
-    var kids = token.tokens;
-    if (!kids || !kids.length) {
-      if (token.type === 'text') return { left: token.raw.slice(0, local), right: token.raw.slice(local) };
-      return local > 0 ? { left: token.raw, right: '' } : { left: '', right: token.raw };
-    }
-    var d = wrapDelim(token.type), dl = d.length;
-    var innerLen = kids.map(function (c) { return c.raw; }).join('').length;
-    var innerLocal = local - dl;
-    if (innerLocal <= 0) return { left: '', right: token.raw };
-    if (innerLocal >= innerLen) return { left: token.raw, right: '' };
-    var sp = splitTokenList(kids, innerLocal);
-    return { left: d + sp.left + d, right: d + sp.right + d };
-  }
-
-  // Split a list of sibling tokens at a byte offset within their concatenated raw.
-  function splitTokenList(kids, off) {
-    var acc = 0, left = '', right = '';
-    for (var i = 0; i < kids.length; i++) {
-      var len = kids[i].raw.length;
-      if (off >= acc + len) { left += kids[i].raw; }
-      else if (off <= acc) { right += kids[i].raw; }
-      else { var sp = splitToken(kids[i], off - acc); left += sp.left; right += sp.right; }
-      acc += len;
-    }
-    return { left: left, right: right };
-  }
-
-  // --- List item structure -------------------------------------------------
+  // --- StyledDoc model — block ops --------------------------------------------
   //
-  // marked drops trailing whitespace from a trailing *empty* item's raw (the
-  // last item of "- one\n- \n" has raw "-"), so item.raw lengths don't tile the
-  // source exactly. We locate each item by forward search, detect empty items
-  // from the source line, and handle indent/outdent line-based — all robust to
-  // that quirk and to nesting.
+  // Each op is a function on the block list — definitional, no delimiters.
+  // Splitting slices a text array (emphasis close/reopen across the split is
+  // free: attrs travel with the chars); merging concatenates; indenting is
+  // depth±1. The wrappers below keep the original string-based signatures.
 
-  var LIST_MARKER = /^(\s*(?:[-*+]|\d+[.)])[ \t]?)/;       // marker incl one optional space
-  var EMPTY_ITEM_LINE = /^\s*(?:[-*+]|\d+[.)])[ \t]*$/;     // a marker with no content
-  var MARKER_LINE = /^\s*(?:[-*+]|\d+[.)])/;
-
-  function itemMarker(raw) { var m = raw.match(LIST_MARKER); return m ? m[1] : ''; }
-  function itemContent(raw) { return raw.slice(itemMarker(raw).length).replace(/\n+$/, ''); }
-
-  // Absolute [start,end) of each top-level item within listMd.
-  function itemSpans(listMd, items) {
-    var spans = [], search = 0;
-    for (var i = 0; i < items.length; i++) {
-      var raw = items[i].raw;
-      var start = listMd.indexOf(raw, search);
-      if (start < 0) start = search;
-      spans.push({ item: items[i], start: start, end: start + raw.length });
-      search = start + raw.length;
-    }
-    return spans;
-  }
-
-  // Index of the (top-level) item the caret sits in: the last item that starts
-  // at or before the offset.
-  function itemAt(spans, offset) {
-    var idx = 0;
-    for (var i = 0; i < spans.length; i++) { if (spans[i].start <= offset) idx = i; }
-    return idx;
-  }
-
-  function lineRange(md, offset) {
-    var start = md.lastIndexOf('\n', offset - 1) + 1;
-    var end = md.indexOf('\n', offset);
-    return { start: start, end: end < 0 ? md.length : end };
-  }
-
-  // Turn the item at index i into a paragraph; items before/after stay lists.
-  function outdentToParagraph(listMd, spans, i) {
-    var before = '', after = '';
-    for (var k = 0; k < spans.length; k++) {
-      if (k < i) before += spans[k].item.raw;
-      else if (k > i) after += spans[k].item.raw;
-    }
-    before = before.replace(/\s+$/, '');
-    after = after.replace(/\s+$/, '');
-    var content = itemContent(spans[i].item.raw);
-    var parts = [];
-    if (before) parts.push(before);
-    parts.push(content);
-    if (after) parts.push(after);
-    return { md: parts.join('\n\n') + '\n', caret: (before ? before.length + 2 : 0) };
-  }
-
-  // Split a list at the caret. Line-based on the caret's item line, so it works
-  // at any nesting depth (the line's own indent+marker is reused for the new
-  // item) and is robust to marked's empty-item raw quirks.
-  function splitList(listMd, offset) {
-    var lr = lineRange(listMd, offset);
-    var line = listMd.slice(lr.start, lr.end);
-    // Empty item under the caret → exit the list.
-    if (EMPTY_ITEM_LINE.test(line)) {
-      return { exit: true, before: listMd.slice(0, lr.start), after: listMd.slice(lr.end + 1) };
-    }
-    var m = line.match(/^(\s*(?:[-*+]|\d+[.)])\s+)/);
-    if (!m) { // continuation/lazy line with no marker — just break the line
-      return { md: listMd.slice(0, offset) + '\n' + listMd.slice(offset), caret: offset + 1 };
-    }
-    var marker = m[1];
-    var rightOnLine = listMd.slice(offset, lr.end);
-    // A new empty item with nothing meaningful after it (it will be the last
-    // item at its level): emit a bare bullet — no trailing space/newline. A
-    // "- \n" trailing item re-lexes into list + a stray `space` token; the bare
-    // form stays one clean list and round-trips. An *indented* bare "-" would
-    // be read as a setext underline, so use "*" there (never a setext char).
-    if (rightOnLine === '' && /^\s*$/.test(listMd.slice(offset))) {
-      var bullet = marker.replace(/\s+$/, '');
-      if (/^\s+-$/.test(bullet)) bullet = bullet.replace('-', '*');
-      return { md: listMd.slice(0, offset) + '\n' + bullet, caret: offset + 1 + bullet.length };
-    }
-    var newMarker = marker;
-    if (rightOnLine === '' && /^\s+-\s+$/.test(newMarker)) newMarker = newMarker.replace('-', '*');
-    return {
-      md: listMd.slice(0, offset) + '\n' + newMarker + listMd.slice(offset),
-      caret: offset + 1 + newMarker.length,
+  function blockWith(b, over) {
+    var out = {
+      kind: b.kind, level: b.level, depth: b.depth, marker: b.marker,
+      text: b.text, prov: b.prov, raw: b.raw, sep: b.sep,
     };
+    for (var k in over) out[k] = over[k];
+    return out;
   }
 
   /**
-   * Backspace at the start of a list item's content. A non-first item merges
-   * its content onto the end of the previous item; the first item (no previous
-   * sibling to merge into) outdents to a plain paragraph.
+   * Split block i at char index ch. Returns { blocks } — or, for Return on an
+   * empty list item, { exit, before, after } (block lists) so the caller can
+   * leave the list. Null on opaque blocks.
    */
-  // Backspace at the start of a list item's content. Line-based, so it works at
-  // any nesting depth: an item with an item line above it merges its content up
-  // into that line (dropping this line's marker); the very first line of the
-  // block outdents to a plain paragraph. Mirrors how a contenteditable joins a
-  // line to the one above, but marker-aware.
-  function mergeListItem(listMd, offset, marked) {
-    var lr = lineRange(listMd, offset);
-    var line = listMd.slice(lr.start, lr.end);
-    var m = line.match(/^(\s*(?:[-*+]|\d+[.)])\s*)/); // indent + marker (+ optional space)
-    if (!m) return { md: listMd, caret: offset };
-    var contentStart = lr.start + m[1].length;
-    if (offset > contentStart) return { md: listMd, caret: offset }; // not at item start
-    if (lr.start === 0) {
-      // First line of the block → outdent to a paragraph; the rest stays a list.
-      var content = line.slice(m[1].length);
-      var rest = listMd.slice(lr.end).replace(/^\n+/, '');
-      return { md: rest ? content + '\n\n' + rest : content + '\n', caret: 0 };
+  function splitBlockM(blocks, i, ch) {
+    var b = blocks[i];
+    if (!b || b.kind === 'opaque') return null;
+    if (b.kind === 'listItem' && !b.text.length) {
+      return { exit: true, before: blocks.slice(0, i), after: blocks.slice(i + 1) };
     }
-    // Merge up: delete the newline before this line and this line's marker.
-    return { md: listMd.slice(0, lr.start - 1) + listMd.slice(contentStart), caret: lr.start - 1 };
-  }
-
-  /** Tab: nest the caret's item line under the item above it. */
-  function indentItem(listMd, offset, marked) {
-    var lr = lineRange(listMd, offset);
-    var line = listMd.slice(lr.start, lr.end);
-    if (lr.start === 0 || !MARKER_LINE.test(line)) return { md: listMd, caret: offset }; // can't nest the first line
-    var indented = '  ' + line;
-    // An empty "-" bullet, once indented under a text line, is parsed as a
-    // setext-H2 underline (turning the parent line into a heading). Switch an
-    // empty dash bullet to "*", which can never be a setext underline.
-    if (/^\s*-\s*$/.test(indented)) indented = indented.replace('-', '*');
-    return { md: listMd.slice(0, lr.start) + indented + listMd.slice(lr.end), caret: offset + 2 };
-  }
-
-  /** Shift+Tab: unindent the caret's item line; a top-level item becomes a paragraph. */
-  function outdentItem(listMd, offset, marked) {
-    var lr = lineRange(listMd, offset);
-    var line = listMd.slice(lr.start, lr.end);
-    var m = line.match(/^( {1,2}|\t)/);
-    if (m) {
-      var out = line.slice(m[1].length);
-      return {
-        md: listMd.slice(0, lr.start) + out + listMd.slice(lr.end),
-        caret: Math.max(lr.start, offset - m[1].length),
+    var left, right;
+    if (b.kind === 'listItem') {
+      left = blockWith(b, { text: b.text.slice(0, ch), raw: null, sep: '\n' });
+      right = blockWith(b, {
+        marker: b.marker && b.marker.ordered
+          ? { ordered: true, num: b.marker.num + 1, delim: b.marker.delim }
+          : { bullet: (b.marker && b.marker.bullet) || '-' },
+        text: b.text.slice(ch), raw: null,
+        // a new empty trailing item prints as a bare marker (sep '')
+        sep: (ch >= b.text.length && i === blocks.length - 1) ? '' : (b.sep != null ? b.sep : '\n'),
+      });
+    } else {
+      left = blockWith(b, { text: b.text.slice(0, ch), raw: null, sep: '\n\n' });
+      right = {
+        kind: 'paragraph', text: b.text.slice(ch), prov: b.prov, raw: null,
+        sep: b.sep != null ? b.sep : '\n',
       };
     }
-    var list = marked.lexer(listMd)[0];
-    if (!list || list.type !== 'list') return { md: listMd, caret: offset };
-    var spans = itemSpans(listMd, list.items);
-    return outdentToParagraph(listMd, spans, itemAt(spans, offset));
+    return { blocks: blocks.slice(0, i).concat([left, right], blocks.slice(i + 1)) };
+  }
+
+  /** Merge block i into block i-1: texts concatenate, the left kind wins. */
+  function mergeBlocksM(blocks, i) {
+    var left = blocks[i - 1], right = blocks[i];
+    if (!left || !right || left.kind === 'opaque' || right.kind === 'opaque') return null;
+    var merged = blockWith(left, {
+      text: left.text.concat(right.text), raw: null,
+      sep: right.sep != null ? right.sep : left.sep,
+    });
+    return blocks.slice(0, i - 1).concat([merged], blocks.slice(i + 1));
+  }
+
+  /** Tab: depth+1. The first block has nothing to nest under. */
+  function indentM(blocks, i) {
+    var b = blocks[i];
+    if (!b || b.kind !== 'listItem' || i === 0) return null;
+    var out = blocks.slice();
+    out[i] = blockWith(b, { depth: b.depth + 1, raw: null });
+    return out;
+  }
+
+  // Append a blank line after a block (a paragraph following a list item
+  // needs one, or it lazily continues the item).
+  function widenSepAfter(b) {
+    if (b.raw != null) {
+      if (/\n\s*\n$/.test(b.raw)) return b;
+      return blockWith(b, { raw: b.raw + '\n', sep: (b.sep || '') + '\n' });
+    }
+    if (/\n\s*\n$/.test(b.sep || '')) return b;
+    return blockWith(b, { sep: (b.sep != null ? b.sep : '\n') + '\n' });
+  }
+
+  /** Shift+Tab: depth-1; a top-level item becomes a paragraph. */
+  function outdentM(blocks, i) {
+    var b = blocks[i];
+    if (!b || b.kind !== 'listItem') return null;
+    var out = blocks.slice();
+    if (b.depth > 0) {
+      out[i] = blockWith(b, { depth: b.depth - 1, raw: null });
+      return out;
+    }
+    out[i] = {
+      kind: 'paragraph', text: b.text, prov: b.prov, raw: null,
+      sep: i < blocks.length - 1 ? '\n\n' : (b.sep != null && b.sep !== '' ? b.sep : '\n'),
+    };
+    if (i > 0 && out[i - 1].kind === 'listItem') out[i - 1] = widenSepAfter(out[i - 1]);
+    return out;
+  }
+
+  /** Swap a styled block's kind, keeping its text. */
+  function setBlockKindM(blocks, i, kind, level) {
+    var b = blocks[i];
+    if (!b || b.kind === 'opaque') return null;
+    var out = blocks.slice();
+    var nb = { kind: kind, text: b.text, prov: b.prov, raw: null, sep: b.sep != null ? b.sep : '\n' };
+    if (kind === 'heading') nb.level = level || b.level || 1;
+    if (kind === 'listItem') { nb.depth = b.depth || 0; nb.marker = b.marker || { bullet: '-' }; }
+    out[i] = nb;
+    return out;
+  }
+
+  // --- the wrappers: original signatures over model ops ------------------------
+
+  // Which block of a parsed run contains the source offset (their raws tile
+  // the segment), and where that block starts.
+  function blockAtOffset(blocks, offset) {
+    var acc = 0;
+    for (var i = 0; i < blocks.length; i++) {
+      var len = blocks[i].raw != null ? blocks[i].raw.length : 0;
+      if (offset < acc + len) return { i: i, start: acc };
+      acc += len;
+    }
+    var last = blocks.length - 1;
+    return last < 0 ? null : { i: last, start: acc - (blocks[last].raw || '').length };
+  }
+
+  function blockFragStart(b) {
+    if (b.kind === 'listItem') {
+      var firstNl = (b.raw || '').indexOf('\n');
+      var line = (b.raw || '').slice(0, firstNl < 0 ? (b.raw || '').length : firstNl);
+      var lm = line.match(LIST_LINE_M);
+      return lm ? lm[1].length + lm[2].length + lm[3].length : 0;
+    }
+    if (b.kind === 'heading') {
+      var hm = (b.raw || '').match(/^#{1,6}[ \t]+/);
+      return hm ? hm[0].length : 0;
+    }
+    return 0;
+  }
+
+  // Source offset (relative to the block's raw) → char index in its text.
+  function blockCharAt(b, rel) {
+    var prov = b.prov || [];
+    if (b.kind === 'quote') {
+      var content = (b.raw || '').replace(/\n+$/, '');
+      var lines = content.split('\n'), pos = 0, fragOff = 0;
+      for (var li = 0; li < lines.length; li++) {
+        var qm = lines[li].match(/^>[ \t]?/);
+        var plen = qm ? qm[0].length : 0;
+        var cLen = lines[li].length - plen;
+        if (rel <= pos + lines[li].length) {
+          return srcToCharIdx(prov, fragOff + Math.max(0, Math.min(rel - pos - plen, cLen)));
+        }
+        pos += lines[li].length + 1;
+        fragOff += cLen + 1;
+      }
+      return srcToCharIdx(prov, fragOff);
+    }
+    return srcToCharIdx(prov, Math.max(0, rel - blockFragStart(b)));
   }
 
   /**
-   * Split a block at a source offset. Paragraphs/headings/blockquotes get a
-   * \n\n inserted (the right side becomes a plain paragraph); emphasis runs
-   * spanning the offset are closed and reopened; lists get a new tight item.
+   * Split a block at a source offset (Return). Same contract as ever:
+   * { md, caret }, or { exit, before, after } for Return on an empty item.
    */
   function splitBlock(blockMd, offset, marked) {
-    var tok = marked.lexer(blockMd)[0];
-    if (tok.type === 'list') return splitList(blockMd, offset, tok);
-    var kids = tok.tokens || [];
-    var innerOld = kids.map(function (c) { return c.raw; }).join('');
-    var cStart = blockMd.indexOf(innerOld);
-    if (cStart < 0) cStart = 0;
-    var prefix = blockMd.slice(0, cStart);
-    var suffix = blockMd.slice(cStart + innerOld.length);
-    var rel = Math.max(0, Math.min(offset - cStart, innerOld.length));
-    var sp = splitTokenList(kids, rel);
-    var leftBlock = prefix + sp.left;
-    return { md: leftBlock + '\n\n' + sp.right + suffix, caret: (leftBlock + '\n\n').length };
+    var blocks = parseBlocks(blockMd, marked);
+    if (!blocks) {
+      var tok0;
+      try { tok0 = marked.lexer(blockMd)[0]; } catch (_) { tok0 = null; }
+      if (tok0 && tok0.type === 'list') return { md: blockMd, caret: offset }; // out-of-model list — refuse
+      return { md: blockMd.slice(0, offset) + '\n\n' + blockMd.slice(offset), caret: offset + 2 };
+    }
+    var loc = blockAtOffset(blocks, offset);
+    var ch = blockCharAt(blocks[loc.i], offset - loc.start);
+    var r = splitBlockM(blocks, loc.i, ch);
+    if (!r) return { md: blockMd, caret: offset };
+    if (r.exit) {
+      return { exit: true, before: printBlocks(r.before, marked), after: printBlocks(r.after, marked) };
+    }
+    var caret = { block: loc.i + 1, ch: 0, offset: -1 };
+    var md = printBlocks(r.blocks, marked, caret);
+    return { md: md, caret: caret.offset >= 0 ? caret.offset : md.length };
   }
 
   /**
-   * Merge the block starting at `offset` into the preceding block by removing
-   * the run of whitespace immediately before it.
+   * Backspace at the start of a list item's content: a non-first item merges
+   * into the previous item; the first item outdents to a paragraph.
    */
-  function mergeBlock(md, offset) {
-    var i = offset;
-    while (i > 0 && /\s/.test(md[i - 1])) i--;
-    return { md: md.slice(0, i) + md.slice(offset), caret: i };
+  function mergeListItem(listMd, offset, marked) {
+    var blocks = parseBlocks(listMd, marked);
+    if (!blocks) return { md: listMd, caret: offset };
+    var loc = blockAtOffset(blocks, offset);
+    var b = blocks[loc.i];
+    if (!b || b.kind !== 'listItem') return { md: listMd, caret: offset };
+    if (offset > loc.start + blockFragStart(b)) return { md: listMd, caret: offset }; // not at item start
+    if (loc.i === 0) {
+      var out = blocks.slice();
+      out[0] = {
+        kind: 'paragraph', text: b.text, prov: b.prov, raw: null,
+        sep: blocks.length > 1 ? '\n\n' : (b.sep != null && b.sep !== '' ? b.sep : '\n'),
+      };
+      return { md: printBlocks(out, marked), caret: 0 };
+    }
+    var merged = mergeBlocksM(blocks, loc.i);
+    if (!merged) return { md: listMd, caret: offset };
+    var caret = { block: loc.i - 1, ch: blocks[loc.i - 1].text.length, offset: -1 };
+    var md = printBlocks(merged, marked, caret);
+    return { md: md, caret: caret.offset >= 0 ? caret.offset : 0 };
+  }
+
+  /** Tab: nest the caret's item one level deeper. */
+  function indentItem(listMd, offset, marked) {
+    var blocks = parseBlocks(listMd, marked);
+    if (!blocks) return { md: listMd, caret: offset };
+    var loc = blockAtOffset(blocks, offset);
+    var ch = blockCharAt(blocks[loc.i], offset - loc.start);
+    var out = indentM(blocks, loc.i);
+    if (!out) return { md: listMd, caret: offset };
+    var caret = { block: loc.i, ch: ch, offset: -1 };
+    var md = printBlocks(out, marked, caret);
+    return { md: md, caret: caret.offset >= 0 ? caret.offset : offset };
+  }
+
+  /** Shift+Tab: unindent; a top-level item becomes a paragraph. */
+  function outdentItem(listMd, offset, marked) {
+    var blocks = parseBlocks(listMd, marked);
+    if (!blocks) return { md: listMd, caret: offset };
+    var loc = blockAtOffset(blocks, offset);
+    var ch = blockCharAt(blocks[loc.i], offset - loc.start);
+    var out = outdentM(blocks, loc.i);
+    if (!out) return { md: listMd, caret: offset };
+    var caret = { block: loc.i, ch: ch, offset: -1 };
+    var md = printBlocks(out, marked, caret);
+    return { md: md, caret: caret.offset >= 0 ? caret.offset : 0 };
+  }
+
+  /**
+   * Merge the block starting at `offset` into the preceding block. With
+   * `marked` and styled prose blocks on both sides this is a model merge
+   * (texts concatenate); otherwise it falls back to removing the whitespace
+   * run before the offset, the historical behavior.
+   */
+  function mergeBlock(md, offset, marked) {
+    if (marked) {
+      var blocks, acc = 0, ti = -1;
+      try { blocks = parseDoc(md, marked).blocks; } catch (_) { blocks = null; }
+      if (blocks) {
+        for (var i = 0; i < blocks.length; i++) {
+          if (acc === offset) { ti = i; break; }
+          acc += blocks[i].raw != null ? blocks[i].raw.length : 0;
+        }
+      }
+      var mergeable = { paragraph: 1, heading: 1, quote: 1 };
+      if (ti > 0 && mergeable[blocks[ti].kind]) {
+        var pi = ti - 1;
+        while (pi >= 0 && blocks[pi].kind === 'opaque' && /^\s*$/.test(blocks[pi].raw)) pi--;
+        if (pi >= 0 && mergeable[blocks[pi].kind]) {
+          var seq = blocks.slice(0, pi + 1).concat(blocks.slice(ti));
+          var merged = mergeBlocksM(seq, pi + 1);
+          if (merged) {
+            var caret = { block: pi, ch: blocks[pi].text.length, offset: -1 };
+            var outMd = printBlocks(merged, marked, caret);
+            return { md: outMd, caret: caret.offset >= 0 ? caret.offset : 0 };
+          }
+        }
+      }
+    }
+    var j = offset;
+    while (j > 0 && /\s/.test(md[j - 1])) j--;
+    return { md: md.slice(0, j) + md.slice(offset), caret: j };
   }
 
   // --- Conflict reconciliation ---------------------------------------------
@@ -1668,6 +1774,11 @@
       printDoc: printDoc,
       readBlocksFromDom: readBlocksFromDom,
       diffBlocks: diffBlocks,
+      splitBlockM: splitBlockM,
+      mergeBlocksM: mergeBlocksM,
+      indentM: indentM,
+      outdentM: outdentM,
+      setBlockKindM: setBlockKindM,
     },
   };
 });

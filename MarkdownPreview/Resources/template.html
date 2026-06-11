@@ -597,7 +597,8 @@
                 // (**f** → ****) which render as literal stars, diverging from
                 // the DOM. Anything unverifiable falls to the reconciler.
                 var cand = EditorCore.applyLeafEdits(seg, res.edits);
-                if (EditorCore.renderedDisplayOf(document, cand, marked) === domText) {
+                if (EditorCore.renderedDisplayOf(document, cand, marked) === domText &&
+                    EditorCore.renderedSkeletonOf(document, cand, marked) === EditorCore.skeletonOfEl(div)) {
                     elog('flush seg=' + i + ' leaf ' + exc(seg.raw) + ' -> ' + exc(cand));
                     seg.raw = cand; relexSeg(seg);
                     return true;
@@ -615,9 +616,16 @@
                 // keeping. Convert to a transient empty paragraph — the same
                 // shape Enter-at-end creates — so typing/Return behave normally.
                 seg.raw = ''; seg.token = null; seg.transient = true; seg.type = 'paragraph';
+                seg.domStale = true;
                 return true;
             }
             seg.raw = rec.raw; relexSeg(seg);
+            // A reconciled edit can change inline structure (e.g. deleting an
+            // emphasis run's text removes its delimiters from source, but the
+            // browser leaves an empty <em> behind that silently formats
+            // whatever is typed or pasted into it). Mark the block so the save
+            // path re-renders it from the new source.
+            seg.domStale = true;
             return true;
         }
         // An unclean flush forced a revert: the DOM edits could not be folded
@@ -815,7 +823,7 @@
             var a = EditorCore.domOffsetToSourceOffset(div, r.startContainer, r.startOffset, seg.token, 'start');
             var b = EditorCore.domOffsetToSourceOffset(div, r.endContainer, r.endOffset, seg.token, 'end');
             var res = EditorCore.toggleEmphasis(seg.raw, a, b, kind, marked);
-            if (!res) return;
+            if (!res) { elog('doEmphasis no-op — toggle unrepresentable at [' + a + ',' + b + ') of ' + exc(seg.raw)); return; }
             // The law for emphasis: formatting changes, visible text never does.
             // Sources with stray delimiters can pass the token check yet shift
             // text — refuse those outright.
@@ -824,6 +832,7 @@
                 return;
             }
             pushUndo();
+            elog('doEmphasis applied [' + a + ',' + b + ') -> ' + exc(res.md));
             seg.raw = res.md; relexSeg(seg); renderSeg(div, seg);
             setSelectionSource(div, seg, res.selStart, res.selEnd);
             scheduleSave();
@@ -1040,8 +1049,38 @@
             var c = contentEl();
             if (!c) return;
             c.querySelectorAll('[data-seg][contenteditable="true"]').forEach(function(div) {
-                if (!flushSegment(div)) revertSeg(div);
+                if (!flushSegment(div)) { revertSeg(div); return; }
+                var seg = _segments[segIndexOf(div)];
+                if (seg && seg.domStale) { delete seg.domStale; refreshSeg(div, seg); }
             });
+        }
+        // Re-render a block whose source structure changed under a live DOM
+        // (zombie formatting elements survive text deletion). The visible text
+        // is identical — the reconciler verified it — so only the caret needs
+        // carrying across, by display offset.
+        function refreshSeg(div, seg) {
+            var sel = window.getSelection(), dispOff = null;
+            if (sel.rangeCount && sel.isCollapsed && div.contains(sel.anchorNode)) {
+                var r = document.createRange();
+                r.setStart(div, 0); r.setEnd(sel.anchorNode, sel.anchorOffset);
+                dispOff = r.toString().length;
+            }
+            elog('refresh seg=' + segIndexOf(div) + ' — re-render after structural reconcile');
+            if (seg.transient) div.innerHTML = '<p><br></p>';
+            else renderSeg(div, seg);
+            if (dispOff == null) return;
+            var w = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+            var acc = 0, n, r2 = document.createRange();
+            while ((n = w.nextNode())) {
+                if (dispOff <= acc + n.textContent.length) {
+                    r2.setStart(n, dispOff - acc); r2.collapse(true);
+                    sel.removeAllRanges(); sel.addRange(r2);
+                    return;
+                }
+                acc += n.textContent.length;
+            }
+            r2.selectNodeContents(div); r2.collapse(false);
+            sel.removeAllRanges(); sel.addRange(r2);
         }
 
         function saveNow() {

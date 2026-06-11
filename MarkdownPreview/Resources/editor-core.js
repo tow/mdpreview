@@ -791,6 +791,23 @@
     return scratch.textContent.replace(/\n+$/, '');
   }
 
+  // Non-empty inline formatting elements with their text — the formatting
+  // fingerprint that must converge between DOM and source. Empty elements are
+  // excluded: a zombie <em> left behind by a deletion renders as nothing.
+  function skeletonOfEl(el) {
+    var out = [], list = el.querySelectorAll('strong,em,a,code,del');
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].textContent.length) out.push(list[i].tagName.toUpperCase() + ':' + list[i].textContent);
+    }
+    return out.join('|');
+  }
+  function renderedSkeletonOf(doc, md, marked) {
+    var scratch = doc.createElement('div');
+    try { scratch.innerHTML = marked.parse(md); } catch (_) { return null; }
+    stripStructuralWhitespace(scratch);
+    return skeletonOfEl(scratch);
+  }
+
   // Does `cand` still lex as (at most) one block that renders exactly
   // `wantDisp`? The acceptance test for any reconciled source.
   function relexMatches(doc, cand, wantDisp, marked) {
@@ -837,33 +854,45 @@
     var newSub = newDisp.slice(p, newDisp.length - s);
     var composites = compositeSpans(blockToken, leaves);
 
-    // Edit edge display→source. Strictly inside a leaf: text leaves map by
-    // offset, opaque leaves can't host an edge. At a boundary both edges bind
-    // to the leaf that *ends* there, so the source between the edges keeps the
-    // markers/delimiters of everything deleted (and they go with it).
-    function srcAt(disp) {
+    // Edit edge display→source, as a list of legal placements. Strictly
+    // inside a leaf there is one (text leaves map by offset; opaque leaves —
+    // codespan, escape — map through their display text's position inside
+    // their raw). At a leaf boundary the display offset is ambiguous: just
+    // inside the leaf that ends there (before its closing delimiter), just
+    // after it, or at the start of the next leaf. Which one the user meant is
+    // decided by trying each and accepting the candidate whose rendering
+    // matches the DOM's formatting fingerprint, not just its text.
+    function srcCandidatesAt(disp) {
       var endsHere = null, startsHere = null;
       for (var i = 0; i < leaves.length; i++) {
         var L = leaves[i];
         if (L.dispStart === L.dispEnd) continue;
         if (disp > L.dispStart && disp < L.dispEnd) {
-          if (L.type === 'text') return L.rawStart + (disp - L.dispStart);
-          // Opaque leaf (codespan, escape): its display text appears verbatim
-          // inside its raw between the delimiters — map through that.
+          if (L.type === 'text') return [L.rawStart + (disp - L.dispStart)];
           var inner = L.token.raw.indexOf(dispTextOf(L.token));
-          return inner >= 0 ? L.rawStart + inner + (disp - L.dispStart) : null;
+          return inner >= 0 ? [L.rawStart + inner + (disp - L.dispStart)] : [];
         }
         if (L.dispEnd === disp) endsHere = L;
         if (L.dispStart === disp && !startsHere) startsHere = L;
       }
-      if (endsHere) return endsHere.rawEnd;
-      if (startsHere) return startsHere.rawStart;
-      return leaves.length ? leaves[0].rawStart : null;
+      var out = [];
+      if (endsHere) {
+        out.push(endsHere.rawEnd);
+        if (endsHere.type !== 'text') {
+          var inn = endsHere.token.raw.indexOf(dispTextOf(endsHere.token));
+          if (inn >= 0) out.push(endsHere.rawStart + inn + dispTextOf(endsHere.token).length);
+        }
+      }
+      if (startsHere && out.indexOf(startsHere.rawStart) < 0) out.push(startsHere.rawStart);
+      if (!out.length && leaves.length) out.push(leaves[0].rawStart);
+      return out;
     }
 
+    var domSkel = skeletonOfEl(el);
     function accept(cand) {
       var tok = relexMatches(el.ownerDocument, cand, newDisp, marked);
       if (tok === null) return null;
+      if (renderedSkeletonOf(el.ownerDocument, cand, marked) !== domSkel) return null;
       return { changed: true, raw: cand, empty: newDisp === '' };
     }
     // Typed text containing markdown specials (*, `, [, …) must reach the
@@ -872,18 +901,24 @@
 
     // Candidate 1: splice the source between the mapped edges, widened over
     // any composite (emphasis run, link, list item) whose entire display text
-    // fell inside the deletion — its delimiters/marker must go too.
-    var a = srcAt(p), b = srcAt(oldEnd);
-    if (a != null && b != null && a <= b) {
-      for (var c = 0; c < composites.length; c++) {
-        var C = composites[c];
-        if (C.ds < C.de && C.ds >= p && C.de <= oldEnd) {
-          a = Math.min(a, C.rs); b = Math.max(b, C.re);
+    // fell inside the deletion — its delimiters/marker must go too. Each
+    // legal edge placement is tried until one renders to the DOM's exact
+    // text + formatting.
+    var aList = srcCandidatesAt(p), bList = srcCandidatesAt(oldEnd);
+    for (var ai = 0; ai < aList.length; ai++) {
+      for (var bi = 0; bi < bList.length; bi++) {
+        var a = aList[ai], b = bList[bi];
+        if (a > b) continue;
+        for (var c = 0; c < composites.length; c++) {
+          var C = composites[c];
+          if (C.ds < C.de && C.ds >= p && C.de <= oldEnd) {
+            a = Math.min(a, C.rs); b = Math.max(b, C.re);
+          }
         }
+        var r1 = accept(raw.slice(0, a) + newSub + raw.slice(b));
+        if (!r1 && newSub) r1 = accept(raw.slice(0, a) + escaped(newSub) + raw.slice(b));
+        if (r1) return r1;
       }
-      var r1 = accept(raw.slice(0, a) + newSub + raw.slice(b));
-      if (!r1 && newSub) r1 = accept(raw.slice(0, a) + escaped(newSub) + raw.slice(b));
-      if (r1) return r1;
     }
 
     // Candidate 2: distribute the edit per-leaf (a partially-deleted emphasis
@@ -938,6 +973,8 @@
     reconcileDomEdit: reconcileDomEdit,
     displayTextOf: displayTextOf,
     renderedDisplayOf: renderedDisplayOf,
+    renderedSkeletonOf: renderedSkeletonOf,
+    skeletonOfEl: skeletonOfEl,
     stripStructuralWhitespace: stripStructuralWhitespace,
     atBlockEdge: atBlockEdge,
     adjacentEditableSeg: adjacentEditableSeg,

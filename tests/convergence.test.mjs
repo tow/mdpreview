@@ -231,6 +231,32 @@ function domDisplay(t) {
   return out;
 }
 
+// Formatting must converge too, not just text: a deletion can leave a zombie
+// <em>/<strong> in the DOM that the source no longer has, silently formatting
+// whatever is typed into it (and making Cmd+I act on the wrong model).
+const SKEL_TAGS = 'strong,em,a,code,del';
+function skeleton(root) {
+  return Array.from(root.querySelectorAll(SKEL_TAGS))
+    .filter((n) => n.textContent.length) // empty zombies render as nothing
+    .map((n) => n.tagName + ':' + n.textContent).join('|');
+}
+function sourceSkeleton(t) {
+  const parts = [];
+  for (const seg of t.win._segments) {
+    if (seg.type === 'space' || seg.transient) continue;
+    const scratch = t.doc.createElement('div');
+    scratch.innerHTML = marked.parse(seg.raw);
+    core.stripStructuralWhitespace(scratch);
+    parts.push(skeleton(scratch));
+  }
+  return parts.filter(Boolean).join('|');
+}
+function domSkeleton(t) {
+  const parts = [];
+  for (const div of t.doc.querySelectorAll('#content [data-seg]')) parts.push(skeleton(div));
+  return parts.filter(Boolean).join('|');
+}
+
 const RUNS = parseInt(process.env.FUZZ_RUNS || '40', 10);
 const STEPS = 25;
 
@@ -246,8 +272,8 @@ for (let seed = 1; seed <= RUNS; seed++) {
       transcript.push(`${step}: ${desc}`);
       // Source must capture the DOM at save time, byte-for-byte in display text.
       t.win.saveNow();
-      const fromSource = sourceDisplay(t);
-      const fromDom = domDisplay(t);
+      const fromSource = sourceDisplay(t) + ' ## ' + sourceSkeleton(t);
+      const fromDom = domDisplay(t) + ' ## ' + domSkeleton(t);
       if (fromSource !== fromDom) {
         assert.fail(
           `DIVERGED after step ${step} (seed ${seed})\n` +

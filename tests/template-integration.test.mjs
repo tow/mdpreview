@@ -218,6 +218,29 @@ test('a selection spanning two blocks deletes across them', async () => {
   assert.equal(t.md(), 'alpha  delta\n');
 });
 
+// The pitch-deck.md bug: delete an italic sentence (the browser keeps the
+// emptied <em> in the DOM), type/paste into the gap — the new text displayed
+// italic while the source said plain, so Cmd+I "did nothing" (it wrapped
+// already-italic-looking text). After a save-path flush the block must be
+// re-rendered from source so DOM formatting matches it again.
+test('deleting an italic run then typing into the gap stays plain', async () => {
+  const t = await setup('Veloci. *Meetings in. Judged.* tail\n');
+  selectAndDelete(t, 'Meetings in. Judged.', 'Meetings in. Judged.');
+  t.win.saveNow(); // reconciles the deletion and refreshes the stale block
+  assert.equal(t.win.currentMarkdown(), 'Veloci.  tail\n');
+  assert.equal(t.doc.querySelector('[data-seg] em'), null,
+    'zombie <em> must be gone after the refresh');
+  // type at the restored caret — must come out plain, in DOM and source
+  const sel = t.win.getSelection();
+  const ev = new t.win.InputEvent('beforeinput', { inputType: 'insertText', data: 'X', bubbles: true, cancelable: true });
+  const anchor = sel.anchorNode;
+  (anchor.nodeType === 1 ? anchor : anchor.parentNode).dispatchEvent(ev);
+  if (!ev.defaultPrevented && anchor.nodeType === 3) anchor.insertData(sel.anchorOffset, 'X');
+  t.win.saveNow();
+  assert.equal(t.win.currentMarkdown(), 'Veloci. X tail\n');
+  assert.equal(t.doc.querySelector('[data-seg] em'), null, 'typed text must not be italic');
+});
+
 test('Cmd+B then Cmd+I on the same word stacks bold and italic', async () => {
   const t = await setup('hello world\n');
   selectAndPressCmd(t.win, 'world', 'b');

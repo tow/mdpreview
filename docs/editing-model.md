@@ -1,5 +1,10 @@
 # Editing model — target architecture
 
+> **Status (2026-06-11): landed.** All four migration steps below are in.
+> The model lives in editor-core.js (`Model` namespace); its laws are pinned
+> by tests/model-{inline,blocks,dom,ops}.test.mjs. The known frontiers at the
+> bottom remain open.
+
 ## Why
 
 Every editing bug shipped so far (resurrected deletions, zombie formatting,

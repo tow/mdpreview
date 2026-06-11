@@ -249,3 +249,106 @@ test('Cmd+B then Cmd+I on the same word stacks bold and italic', async () => {
   selectAndPressCmd(t.win, 'world', 'i');
   assert.equal(t.md(), 'hello ***world***\n');
 });
+
+// --- Cross-block selection: copy-only --------------------------------------
+//
+// Cmd+A (and cross-block mouse drags) exist so the user can Cmd+C the whole
+// document. While a selection spans more than one block the blocks are parked
+// contenteditable=false — the selection renders as an ordinary page selection
+// (greyed via #content.cross-select) and native copy works; every key that
+// would EDIT the selection is refused, leaving the source untouched.
+
+// Dispatch a keydown on the document, the way the capture-phase router
+// receives it from WKWebView regardless of where focus sits.
+function pressDocKey(t, key, init) {
+  const ev = new t.win.KeyboardEvent('keydown', Object.assign({ key, bubbles: true, cancelable: true }, init || {}));
+  t.doc.dispatchEvent(ev);
+  return ev;
+}
+const segDivs = (t) => Array.from(t.doc.querySelectorAll('#content [data-seg]'));
+
+test('Cmd+A selects first block through last and parks blocks read-only', async () => {
+  const t = await setup('# Head\n\nalpha bravo\n\n- one\n- two\n');
+  const ev = pressDocKey(t, 'a', { metaKey: true });
+  assert.equal(ev.defaultPrevented, true, 'Cmd+A must be claimed');
+  const sel = t.win.getSelection();
+  assert.equal(sel.rangeCount, 1);
+  const text = sel.getRangeAt(0).toString();
+  assert.ok(text.includes('Head') && text.includes('two'),
+    `selection must span the whole document: ${JSON.stringify(text)}`);
+  assert.ok(segDivs(t).every((d) => d.getAttribute('contenteditable') === 'false'),
+    'all blocks parked read-only');
+  assert.ok(t.doc.getElementById('content').classList.contains('cross-select'),
+    'grey-selection signal class present');
+});
+
+test('Cmd+A twice is idempotent', async () => {
+  const t = await setup('alpha\n\nbravo\n');
+  const before = t.md();
+  pressDocKey(t, 'a', { metaKey: true });
+  pressDocKey(t, 'a', { metaKey: true });
+  const sel = t.win.getSelection();
+  assert.equal(sel.rangeCount, 1);
+  assert.ok(sel.getRangeAt(0).toString().includes('bravo'));
+  assert.equal(t.md(), before);
+});
+
+test('editing keys over a select-all are refused and leave the source untouched', async () => {
+  const t = await setup('alpha\n\n- one\n- two\n');
+  const before = t.md();
+  pressDocKey(t, 'a', { metaKey: true });
+  for (const [key, init] of [['Backspace'], ['Delete'], ['Enter'], ['Tab'], ['x'],
+    ['x', { metaKey: true }], ['v', { metaKey: true }], ['b', { metaKey: true }]]) {
+    const ev = pressDocKey(t, key, init);
+    assert.equal(ev.defaultPrevented, true, `${init && init.metaKey ? 'Cmd+' : ''}${key} must be refused`);
+  }
+  assert.equal(t.md(), before, 'source must be byte-identical');
+  // Cmd+C is NOT intercepted — native copy of the page selection
+  const c = pressDocKey(t, 'c', { metaKey: true });
+  assert.equal(c.defaultPrevented, false, 'Cmd+C must fall through to native copy');
+  t.win.saveNow();
+  assert.equal(t.saved(), before, 'saved bytes unchanged');
+});
+
+test('Escape collapses a select-all and restores per-block editing', async () => {
+  const t = await setup('alpha\n\n- one\n- two\n');
+  pressDocKey(t, 'a', { metaKey: true });
+  const ev = pressDocKey(t, 'Escape');
+  assert.equal(ev.defaultPrevented, true);
+  assert.ok(t.win.getSelection().isCollapsed, 'selection collapsed');
+  assert.ok(!t.doc.getElementById('content').classList.contains('cross-select'),
+    'grey-selection signal removed');
+  assert.ok(segDivs(t).every((d) => d.getAttribute('contenteditable') === 'true'),
+    'editable blocks restored');
+});
+
+test('Cmd+A in a single-block document selects within the block, still editable', async () => {
+  const t = await setup('hello world\n');
+  const ev = pressDocKey(t, 'a', { metaKey: true });
+  assert.equal(ev.defaultPrevented, true);
+  assert.equal(t.win.getSelection().getRangeAt(0).toString(), 'hello world');
+  assert.equal(t.seg().getAttribute('contenteditable'), 'true', 'single block stays editable');
+  assert.ok(!t.doc.getElementById('content').classList.contains('cross-select'));
+});
+
+test('Cmd+A flushes a pending DOM edit before parking the blocks', async () => {
+  const t = await setup('alpha bravo\n\nsecond\n');
+  const walk = t.doc.createTreeWalker(t.doc.getElementById('content'), t.win.NodeFilter.SHOW_TEXT);
+  let n, node = null;
+  while ((n = walk.nextNode())) { if (n.textContent.includes('bravo')) { node = n; break; } }
+  node.textContent = 'alpha Xbravo'; // a typed-but-unflushed DOM edit
+  pressDocKey(t, 'a', { metaKey: true });
+  assert.ok(t.md().includes('alpha Xbravo'), `pending edit must reach the source: ${JSON.stringify(t.md())}`);
+});
+
+test('Cmd+Z routed at document level still undoes after Cmd+A', async () => {
+  const t = await setup('hello world\n\nsecond\n');
+  selectAndPressCmd(t.win, 'world', 'b');
+  assert.equal(t.md(), 'hello **world**\n\nsecond\n');
+  pressDocKey(t, 'a', { metaKey: true });
+  const ev = pressDocKey(t, 'z', { metaKey: true });
+  assert.equal(ev.defaultPrevented, true);
+  assert.equal(t.md(), 'hello world\n\nsecond\n', 'undo must apply');
+  assert.ok(!t.doc.getElementById('content').classList.contains('cross-select'),
+    'the re-render exits cross mode');
+});

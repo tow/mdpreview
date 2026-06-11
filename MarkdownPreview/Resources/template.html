@@ -130,6 +130,11 @@
         #content .seg { outline: none; }
         #content .seg[contenteditable="true"]:focus { outline: none; }
 
+        /* Cross-block (copy-only) selection: the macOS inactive-selection
+           grey signals "selected, but not live for typing" — in-block
+           selections keep the native editing blue. */
+        #content.cross-select ::selection { background: rgba(127, 127, 127, 0.35); color: inherit; }
+
         /* Blocking conflict overlay */
         .conflict-panel {
             border: 1px solid #d9a441;
@@ -196,6 +201,13 @@
         // empty <li>): { segIndex, srcOffset }. Typing is intercepted and folded
         // into the source at srcOffset, since the DOM has nowhere to read it.
         var _pendingEmpty = null;
+        // Cross-block copy-only selection: while a selection spans more than
+        // one block, every block is parked contenteditable=false so the
+        // selection is an ordinary page selection (paintable, Cmd+C-able);
+        // editing it is refused. _drag tracks a potential cross-block mouse
+        // drag from mousedown: { x, y, anchorDiv, anchorNode, anchorOffset }.
+        var _crossMode = false;
+        var _drag = null;
 
         function mermaidTheme() {
             // Force default theme in document/PDF mode (matches force-light behavior);
@@ -287,6 +299,10 @@
                 document.body.appendChild(content);
             }
             var scrollTop = window.scrollY;
+            // A rebuild replaces every block with fresh attributes — any
+            // cross-block copy-only selection is gone with the old DOM.
+            _crossMode = false; _drag = null;
+            content.classList.remove('cross-select');
             // Segmented render: one editable <div data-seg> per top-level block,
             // so edits can be folded back into just that block's source. `space`
             // separators stay in _segments (for reassembly) but aren't rendered.
@@ -1147,12 +1163,150 @@
             doEmphasis(div, k === 'b' ? 'strong' : 'em');
         }
 
+        // --- Cross-block selection: copy-only --------------------------------
+        // Cmd+A and cross-block mouse drags exist so the user can Cmd+C the
+        // whole document (or a span of blocks). Editing such a selection is
+        // deliberately unsupported: WebKit has no native editing behavior for
+        // a selection spanning separate contenteditable islands, so while one
+        // exists the blocks are parked contenteditable=false — the selection
+        // becomes an ordinary page selection (painted across blocks, natively
+        // copyable, greyed via #content.cross-select) — and every key that
+        // would edit it is refused. Escape, arrows, or a click collapse it and
+        // restore per-block editing; any re-render exits the mode too.
+
+        function enterCrossMode() {
+            if (_crossMode) return;
+            flushActive(); // capture pending DOM edits while blocks are still editable
+            var content = contentEl();
+            content.querySelectorAll('[data-seg]').forEach(function (div) {
+                div.setAttribute('contenteditable', 'false');
+            });
+            content.classList.add('cross-select');
+            _crossMode = true;
+            elog('crossMode enter');
+        }
+
+        function exitCrossMode() {
+            if (!_crossMode) return;
+            var content = contentEl();
+            var editing = (_currentMode === 'reading' && _conflicts.length === 0);
+            content.querySelectorAll('[data-seg]').forEach(function (div) {
+                var seg = _segments[segIndexOf(div)];
+                var on = seg && (seg.transient || (editing && seg.editable));
+                div.setAttribute('contenteditable', on ? 'true' : 'false');
+            });
+            content.classList.remove('cross-select');
+            _crossMode = false;
+            elog('crossMode exit');
+        }
+
+        function selectWholeDocument() {
+            var divs = contentEl().querySelectorAll('[data-seg]');
+            if (!divs.length) return;
+            var sel = window.getSelection();
+            if (divs.length === 1) { // one block: an ordinary editable selection
+                sel.selectAllChildren(divs[0]);
+                return;
+            }
+            enterCrossMode();
+            var last = divs[divs.length - 1];
+            var r = document.createRange();
+            r.setStart(divs[0], 0);
+            r.setEnd(last, last.childNodes.length);
+            sel.removeAllRanges();
+            sel.addRange(r);
+            elog('selectAll ' + selDesc());
+        }
+
+        // Capture-phase router on document: in cross mode nothing is editable,
+        // so keys never reach the content-level handlers or beforeinput — they
+        // are seen (and the editing ones refused) here.
+        function onDocKeydown(e) {
+            if (_currentMode !== 'reading' || _conflicts.length) return;
+            var meta = e.metaKey && !e.ctrlKey && !e.altKey;
+            var k = (e.key || '').toLowerCase();
+            if (meta && !e.shiftKey && k === 'a') {
+                e.preventDefault(); e.stopPropagation();
+                selectWholeDocument();
+                return;
+            }
+            if (!_crossMode) return;
+            if (!crossBlockSel()) { exitCrossMode(); return; } // stray state — restore, fall through
+            if (meta && k === 'z') { e.preventDefault(); e.stopPropagation(); if (e.shiftKey) redo(); else undo(); return; }
+            if (meta && k === 'c') return; // native copy of the page selection
+            if (e.key === 'Escape' || (/^Arrow/.test(e.key) && !e.shiftKey)) {
+                e.preventDefault(); e.stopPropagation();
+                var sel = window.getSelection();
+                if (sel.rangeCount) {
+                    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') sel.collapseToEnd();
+                    else sel.collapseToStart();
+                }
+                exitCrossMode();
+                return;
+            }
+            // Anything that would edit the copy-only selection: printable keys
+            // (incl. Cmd+X/V/B/I chords), Backspace/Delete, Enter, Tab.
+            if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete' ||
+                e.key === 'Enter' || e.key === 'Tab') {
+                e.preventDefault(); e.stopPropagation();
+                elog('crossMode refuse key=' + (meta ? 'Cmd+' : '') + e.key);
+            }
+        }
+
+        function onSelectionChange() {
+            if (!_crossMode || _drag) return;
+            var sel = window.getSelection();
+            if (!sel.rangeCount) return; // transient no-range state mid-update
+            if (!crossBlockSel()) exitCrossMode();
+        }
+
+        function onMouseDown(e) {
+            if (e.button !== 0 || _currentMode !== 'reading' || _conflicts.length) return;
+            if (_crossMode) exitCrossMode(); // a click collapses the copy-only selection
+            var div = segDivFor(e.target);
+            _drag = div ? { x: e.clientX, y: e.clientY, anchorDiv: div, anchorNode: null, anchorOffset: 0 } : null;
+        }
+
+        function onMouseMove(e) {
+            if (!_drag) return;
+            var over = segDivFor(e.target);
+            if (!over && document.elementFromPoint) over = segDivFor(document.elementFromPoint(e.clientX, e.clientY));
+            if (!_crossMode) {
+                if (!over || over === _drag.anchorDiv) return; // same-block drags stay native
+                enterCrossMode();
+                // The flush may have rebuilt the DOM — resolve the anchor only
+                // now, from the recorded mousedown coordinates.
+                var ar = document.caretRangeFromPoint && document.caretRangeFromPoint(_drag.x, _drag.y);
+                if (ar) { _drag.anchorNode = ar.startContainer; _drag.anchorOffset = ar.startOffset; }
+                else { _drag.anchorNode = _drag.anchorDiv; _drag.anchorOffset = 0; }
+                elog('crossDrag from ' + selDesc());
+            }
+            e.preventDefault();
+            var fr = document.caretRangeFromPoint && document.caretRangeFromPoint(e.clientX, e.clientY);
+            if (fr && contentEl().contains(fr.startContainer)) {
+                window.getSelection().setBaseAndExtent(_drag.anchorNode, _drag.anchorOffset, fr.startContainer, fr.startOffset);
+            }
+            // Native autoscroll died with the editable drag — emulate at the edges.
+            if (e.clientY < 30) window.scrollBy(0, -20);
+            else if (e.clientY > window.innerHeight - 30) window.scrollBy(0, 20);
+        }
+
+        function onMouseUp() {
+            _drag = null;
+            if (_crossMode && !crossBlockSel()) exitCrossMode();
+        }
+
         function bindEditingListeners(content) {
             if (_listenersBound) return;
             content.addEventListener('beforeinput', onBeforeInput);
             content.addEventListener('keydown', onKeydown);
             content.addEventListener('paste', onPaste);
             content.addEventListener('blur', onBlur, true);
+            content.addEventListener('mousedown', onMouseDown);
+            document.addEventListener('keydown', onDocKeydown, true);
+            document.addEventListener('selectionchange', onSelectionChange);
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
             _listenersBound = true;
         }
 

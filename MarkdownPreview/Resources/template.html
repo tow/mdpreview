@@ -590,7 +590,10 @@
             if (!seg || seg.transient || !seg.token) return true; // no source to fold into
             var rec = EditorCore.reconcileDomEdit(div, seg.token, marked, _baseURL);
             if (rec == null) {
-                elog('flush seg=' + i + ' FAILED — DOM edit not reconcilable, raw=' + exc(seg.raw) + ' dom=' + exc(div.textContent));
+                // Log the remnant's full markup, not just its text: a refusal
+                // means the DOM holds a shape the model didn't anticipate, and
+                // the innerHTML is a paste-ready fixture for dom-reconcile tests.
+                elog('flush seg=' + i + ' FAILED — DOM edit not reconcilable, raw=' + exc(seg.raw) + ' dom=' + exc(div.textContent) + ' html=' + exc(div.innerHTML, 2000));
                 return false;
             }
             if (!rec.changed) return true;

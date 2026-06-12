@@ -341,6 +341,50 @@ test('Cmd+A flushes a pending DOM edit before parking the blocks', async () => {
   assert.ok(t.md().includes('alpha Xbravo'), `pending edit must reach the source: ${JSON.stringify(t.md())}`);
 });
 
+// Drive a cross-block mouse drag with stubbed geometry: jsdom has no layout,
+// so caretRangeFromPoint is faked with a coordinate→position map.
+function dragSetup(t, pointMap) {
+  t.doc.caretRangeFromPoint = (x, y) => {
+    const p = pointMap[x + ',' + y];
+    if (!p) return null;
+    const r = t.doc.createRange();
+    r.setStart(p.node, p.offset);
+    r.collapse(true);
+    return r;
+  };
+  t.win.scrollBy = () => {};
+}
+function mouse(t, type, target, x, y) {
+  target.dispatchEvent(new t.win.MouseEvent(type, { button: 0, clientX: x, clientY: y, bubbles: true, cancelable: true }));
+}
+
+test('the grey signal tracks the selection span live during a drag', async () => {
+  const t = await setup('alpha bravo\n\ncharlie delta\n');
+  const textNode = (s) => {
+    const walk = t.doc.createTreeWalker(t.doc.getElementById('content'), t.win.NodeFilter.SHOW_TEXT);
+    let n; while ((n = walk.nextNode())) if (n.textContent.includes(s)) return n;
+  };
+  const a = textNode('alpha'), c = textNode('charlie');
+  dragSetup(t, {
+    '10,100': { node: a, offset: 2 },   // mousedown anchor inside block 1
+    '10,200': { node: c, offset: 3 },   // drag down into block 2
+    '40,100': { node: a, offset: 8 },   // drag back up inside block 1
+  });
+  const content = t.doc.getElementById('content');
+  mouse(t, 'mousedown', a.parentNode, 10, 100);
+  mouse(t, 'mousemove', c.parentNode, 10, 200); // crosses into block 2
+  assert.ok(content.classList.contains('cross-select'),
+    'spanning two blocks: grey signal on');
+  assert.ok(t.win.crossBlockSel(), 'selection must span the two blocks');
+  mouse(t, 'mousemove', a.parentNode, 40, 100); // back inside block 1
+  assert.ok(!content.classList.contains('cross-select'),
+    'selection back within one block: signal must return to blue');
+  mouse(t, 'mouseup', a.parentNode, 40, 100);
+  assert.ok(!content.classList.contains('cross-select'), 'signal off after release');
+  assert.ok(segDivs(t).every((d) => d.getAttribute('contenteditable') === 'true'),
+    'single-block release restores per-block editing');
+});
+
 test('Cmd+Z routed at document level still undoes after Cmd+A', async () => {
   const t = await setup('hello world\n\nsecond\n');
   selectAndPressCmd(t.win, 'world', 'b');

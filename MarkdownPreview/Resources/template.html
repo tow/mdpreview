@@ -1174,19 +1174,27 @@
         // would edit it is refused. Escape, arrows, or a click collapse it and
         // restore per-block editing; any re-render exits the mode too.
 
+        // The grey copy-only signal tracks the SELECTION, not the mode: a drag
+        // can cross into another block (grey) and come back inside one block
+        // (blue again) before the mode itself ends at mouseup.
+        function updateCrossSignal() {
+            contentEl().classList.toggle('cross-select', !!(_crossMode && crossBlockSel()));
+        }
+
         function enterCrossMode() {
             if (_crossMode) return;
             flushActive(); // capture pending DOM edits while blocks are still editable
-            var content = contentEl();
-            content.querySelectorAll('[data-seg]').forEach(function (div) {
+            contentEl().querySelectorAll('[data-seg]').forEach(function (div) {
                 div.setAttribute('contenteditable', 'false');
             });
-            content.classList.add('cross-select');
             _crossMode = true;
             elog('crossMode enter');
         }
 
-        function exitCrossMode() {
+        // Restore per-block editability; with focusDiv, put focus back in that
+        // block (preserving the selection) so an in-block selection left
+        // behind is immediately live for typing again.
+        function exitCrossMode(focusDiv) {
             if (!_crossMode) return;
             var content = contentEl();
             var editing = (_currentMode === 'reading' && _conflicts.length === 0);
@@ -1197,6 +1205,12 @@
             });
             content.classList.remove('cross-select');
             _crossMode = false;
+            if (focusDiv && focusDiv.getAttribute && focusDiv.getAttribute('contenteditable') === 'true') {
+                var sel = window.getSelection();
+                var saved = sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+                if (focusDiv.focus) focusDiv.focus();
+                if (saved) { sel.removeAllRanges(); sel.addRange(saved); }
+            }
             elog('crossMode exit');
         }
 
@@ -1215,6 +1229,7 @@
             r.setEnd(last, last.childNodes.length);
             sel.removeAllRanges();
             sel.addRange(r);
+            updateCrossSignal();
             elog('selectAll ' + selDesc());
         }
 
@@ -1241,7 +1256,7 @@
                     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') sel.collapseToEnd();
                     else sel.collapseToStart();
                 }
-                exitCrossMode();
+                exitCrossMode(segDivFor(sel.anchorNode));
                 return;
             }
             // Anything that would edit the copy-only selection: printable keys
@@ -1258,6 +1273,7 @@
             var sel = window.getSelection();
             if (!sel.rangeCount) return; // transient no-range state mid-update
             if (!crossBlockSel()) exitCrossMode();
+            else updateCrossSignal();
         }
 
         function onMouseDown(e) {
@@ -1286,6 +1302,7 @@
             if (fr && contentEl().contains(fr.startContainer)) {
                 window.getSelection().setBaseAndExtent(_drag.anchorNode, _drag.anchorOffset, fr.startContainer, fr.startOffset);
             }
+            updateCrossSignal();
             // Native autoscroll died with the editable drag — emulate at the edges.
             if (e.clientY < 30) window.scrollBy(0, -20);
             else if (e.clientY > window.innerHeight - 30) window.scrollBy(0, 20);
@@ -1293,7 +1310,13 @@
 
         function onMouseUp() {
             _drag = null;
-            if (_crossMode && !crossBlockSel()) exitCrossMode();
+            if (!_crossMode) return;
+            if (!crossBlockSel()) {
+                var sel = window.getSelection();
+                exitCrossMode(sel.rangeCount ? segDivFor(sel.anchorNode) : null);
+            } else {
+                updateCrossSignal();
+            }
         }
 
         function bindEditingListeners(content) {
